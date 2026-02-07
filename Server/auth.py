@@ -163,6 +163,24 @@ def handle_preflight():
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         return response
+    
+@app.route('/messages/<msg_id>', methods=['DELETE'])
+def delete_message(msg_id):
+    """Device deletes processed message after ack"""
+    session_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    device_id = verify_session(session_token)
+    if not device_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    result = messages.delete_one({
+        '_id': ObjectId(msg_id),
+        'device_id': device_id,
+        'acked': True  # Only delete acknowledged messages
+    })
+    
+    if result.deleted_count:
+        return jsonify({'status': 'deleted', 'count': result.deleted_count})
+    return jsonify({'error': 'Message not found or not acked'}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)
