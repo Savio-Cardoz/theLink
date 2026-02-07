@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IoT Device Test Client</title>
+    <style>
+        body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .endpoint { border: 1px solid #ccc; margin: 20px 0; padding: 15px; border-radius: 8px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        textarea { width: 100%; height: 100px; font-family: monospace; }
+        .response { background: #f8f9fa; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>🚀 IoT Flask Server Test Client</h1>
+    <p><strong>Server URL:</strong> <input id="baseUrl" type="text" value="http://localhost:5000" style="width:400px;"></p>
+    
+    <div class="endpoint">
+        <h3>1. Authenticate Device 🔐</h3>
+        <label>Device ID: <input id="deviceId" type="text" value="esp32_001"></label><br><br>
+        <button onclick="authenticate()">Get Challenge & Authenticate</button>
+        <div id="authResponse"></div>
+    </div>
+
+    <div class="endpoint">
+        <h3>2. Poll Messages 📥 (Device)</h3>
+        <label>Last Message ID: <input id="lastId" type="text" value=""></label><br>
+        <label>Session Token: <input id="sessionToken" type="text" placeholder="Bearer from auth"></label><br><br>
+        <button onclick="pollMessages()">GET /messages</button>
+        <div id="pollResponse"></div>
+    </div>
+
+    <div class="endpoint">
+        <h3>3. Ack Message ✅ (Device)</h3>
+        <label>Message ID: <input id="ackId" type="text"></label><br>
+        <label>Session Token: <input id="ackToken" type="text"></label><br><br>
+        <button onclick="ackMessage()">PATCH /messages/{id}/ack</button>
+        <div id="ackResponse"></div>
+    </div>
+
+    <div class="endpoint">
+        <h3>4. Send Message 📤 (User)</h3>
+        <label>Device ID: <input id="sendDevice" type="text" value="esp32_001"></label><br>
+        <textarea id="sendPayload" placeholder='{"cmd": "led_on"}'>{"cmd": "status_check"}</textarea><br>
+        <label>Type: 
+            <select id="payloadType">
+                <option value="json">JSON</option>
+                <option value="string">String</option>
+                <option value="binary">Binary (base64)</option>
+            </select>
+        </label><br><br>
+        <button onclick="sendMessage()">POST /send/{device}</button>
+        <div id="sendResponse"></div>
+    </div>
+
+    <div class="endpoint">
+        <h3>5. Download File 📥 (Device)</h3>
+        <label>File ID: <input id="fileId" type="text"></label><br>
+        <label>Session Token: <input id="fileToken" type="text"></label><br><br>
+        <button onclick="downloadFile()">GET /files/{id}</button>
+        <div id="fileResponse"></div>
+    </div>
+
+    <script>
+        const BASE_URL = document.getElementById('baseUrl');
+        
+        async function apiCall(url, options = {}) {
+            try {
+                const response = await fetch(url, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    },
+                    ...options
+                });
+                const data = await response.text();
+                return { response, data: data || 'Empty', ok: response.ok };
+            } catch (error) {
+                return { error: error.message };
+            }
+        }
+
+        async function authenticate() {
+            const deviceId = document.getElementById('deviceId').value;
+            const div = document.getElementById('authResponse');
+            
+            // Step 1: Get challenge
+            let res = await apiCall(`${BASE_URL.value}/auth/init`, {
+                method: 'POST',
+                body: JSON.stringify({device_id: deviceId})
+            });
+            div.innerHTML = `<div class="response">${JSON.stringify(res.data, null, 2)}</div>`;
+            
+            if (res.ok) {
+                const challenge = JSON.parse(res.data).challenge;
+                // Step 2: Compute response (server-side only; simulate)
+                res = await apiCall(`${BASE_URL.value}/auth/verify`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        device_id: deviceId,
+                        challenge: challenge,
+                        response: "simulated_aes_response_hex"  // ESP32 computes this
+                    })
+                });
+                div.innerHTML += `<div class="response">${JSON.stringify(res.data, null, 2)}</div>`;
+                if (res.ok) {
+                    const token = JSON.parse(res.data).session_token;
+                    document.getElementById('sessionToken').value = token;
+                    document.getElementById('ackToken').value = token;
+                    document.getElementById('fileToken').value = token;
+                    div.innerHTML += `<p class="success">✅ Copy session token above!</p>`;
+                }
+            }
+        }
+
+        async function pollMessages() {
+            const token = document.getElementById('sessionToken').value;
+            const lastId = document.getElementById('lastId').value;
+            const url = `${BASE_URL.value}/messages${lastId ? `?last_id=${lastId}` : ''}`;
+            
+            const res = await apiCall(url, {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+            document.getElementById('pollResponse').innerHTML = 
+                `<div class="response">${JSON.stringify(res.data, null, 2)}</div>`;
+            
+            if (res.ok && res.data.messages) {
+                res.data.messages.forEach(msg => {
+                    document.getElementById('ackId').value = msg._id;
+                });
+            }
+        }
+
+        async function ackMessage() {
+            const id = document.getElementById('ackId').value;
+            const token = document.getElementById('ackToken').value;
+            
+            const res = await apiCall(`${BASE_URL.value}/messages/${id}/ack`, {
+                method: 'PATCH',
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+            document.getElementById('ackResponse').innerHTML = 
+                `<div class="response">${JSON.stringify(res.data, null, 2)}</div>`;
+        }
+
+        async function sendMessage() {
+            const device = document.getElementById('sendDevice').value;
+            const payload = document.getElementById('sendPayload').value;
+            const type = document.getElementById('payloadType').value;
+            
+            const body = {
+                payload: JSON.parse(payload),
+                type: type
+            };
+            
+            const res = await apiCall(`${BASE_URL.value}/send/${device}`, {
+                method: 'POST',
+                body: JSON.stringify(body)
+            });
+            document.getElementById('sendResponse').innerHTML = 
+                `<div class="response">${JSON.stringify(res.data, null, 2)}</div>`;
+        }
+
+        async function downloadFile() {
+            const id = document.getElementById('fileId').value;
+            const token = document.getElementById('fileToken').value;
+            
+            const res = await apiCall(`${BASE_URL.value}/files/${id}`, {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+            
+            if (res.ok) {
+                const blob = new Blob([res.data]);
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `file_${id}`;
+                a.click();
+                document.getElementById('fileResponse').innerHTML = 
+                    `<div class="success">✅ File downloaded! Size: ${res.data.length} bytes</div>`;
+            } else {
+                document.getElementById('fileResponse').innerHTML = 
+                    `<div class="error">❌ ${JSON.stringify(res.data)}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
