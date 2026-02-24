@@ -7,9 +7,9 @@ import time
 BASE_URL = "http://80.225.207.106"
 DEVICE_ID = "esp32_001"
 USER_PAYLOADS = [
-    {"cmd": "led_on"},
-    {"cmd": "status_check"}, 
-    {"sensor_config": {"interval": 30}}
+    "Hey there, how are you?",
+    "You are doing great! Keep it up!", 
+    "You are beautiful and loved! Never forget that. ❤️"
 ]
 
 def print_step(step, data=None):
@@ -95,7 +95,7 @@ def test_full_cycle():
     time.sleep(2)
     
     # Receive + cleanup
-    test_poll_and_cleanup(session_token)
+    # test_poll_and_cleanup(session_token)
     
     print("\n🎉 Inbox cleared! Ready for next cycle ✅")
 

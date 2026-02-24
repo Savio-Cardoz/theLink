@@ -1,5 +1,11 @@
 menu "Example Configuration"
 
+    config EXAMPLE_HTTP_ENDPOINT
+        string "Example HTTP Endpoint"
+        default "80.225.207.106"
+        help
+            Target endpoint host-name for the example to use.
+
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
         default EXAMPLE_PROV_TRANSPORT_SOFTAP if IDF_TARGET_ESP32S2

@@ -31,6 +31,21 @@
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
 #include "qrcode.h"
 
+#include "esp_http_client.h"
+#include "esp_tls.h"
+#include <sys/param.h>
+#include "cJSON.h"
+#include "mbedtls/md.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/cipher.h"
+#include "mbedtls/aes.h"
+
+#define PRESHARED_SECRET "your_pre_shared_secret" // Matches auth.py
+#define DEVICE_ID "esp32_001"                     // Matches auth.py
+
+#define MAX_HTTP_RECV_BUFFER 512
+#define MAX_HTTP_OUTPUT_BUFFER 2048
+
 static const char *TAG = "app";
 
 volatile bool user_button_pressed = false;
@@ -122,6 +137,110 @@ static EventGroupHandle_t wifi_event_group;
 #define PROV_TRANSPORT_SOFTAP "softap"
 #define PROV_TRANSPORT_BLE "ble"
 #define QRCODE_BASE_URL "https://espressif.github.io/esp-jumpstart/qrcode.html"
+
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    static char *output_buffer; // Buffer to store response of http request from event handler
+    static int output_len;      // Stores number of bytes read
+    switch (evt->event_id)
+    {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        // Clean the buffer in case of a new request
+        if (output_len == 0 && evt->user_data)
+        {
+            // we are just starting to copy the output data into the use
+            memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
+        }
+        /*
+         *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+         *  However, event handler can also be used in case chunked encoding is used.
+         */
+        if (!esp_http_client_is_chunked_response(evt->client))
+        {
+            // If user_data buffer is configured, copy the response into the buffer
+            int copy_len = 0;
+            if (evt->user_data)
+            {
+                // The last byte in evt->user_data is kept for the NULL character in case of out-of-bound access.
+                copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
+                if (copy_len)
+                {
+                    memcpy(evt->user_data + output_len, evt->data, copy_len);
+                }
+            }
+            else
+            {
+                int content_len = esp_http_client_get_content_length(evt->client);
+                if (output_buffer == NULL)
+                {
+                    // We initialize output_buffer with 0 because it is used by strlen() and similar functions therefore should be null terminated.
+                    output_buffer = (char *)calloc(content_len + 1, sizeof(char));
+                    output_len = 0;
+                    if (output_buffer == NULL)
+                    {
+                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+                }
+                copy_len = MIN(evt->data_len, (content_len - output_len));
+                if (copy_len)
+                {
+                    memcpy(output_buffer + output_len, evt->data, copy_len);
+                }
+            }
+            output_len += copy_len;
+        }
+
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+        if (output_buffer != NULL)
+        {
+            // Response is accumulated in output_buffer. Uncomment the below line to print the accumulated response
+            // ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+        int mbedtls_err = 0;
+        esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
+        if (err != 0)
+        {
+            ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
+            ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+        }
+        if (output_buffer != NULL)
+        {
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_REDIRECT:
+        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+        esp_http_client_set_header(evt->client, "From", "user@example.com");
+        esp_http_client_set_header(evt->client, "Accept", "text/html");
+        esp_http_client_set_redirection(evt->client);
+        break;
+    }
+    return ESP_OK;
+}
 
 /* Event handler for catching system events */
 static void event_handler(void *arg, esp_event_base_t event_base,
@@ -341,6 +460,272 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
     .user_data = NULL,
 };
 #endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
+
+void hex_to_bytes(const char *hex_str, size_t hex_len, uint8_t *bytes)
+{
+    for (size_t i = 0; i < hex_len / 2; i++)
+    {
+        sscanf(hex_str + 2 * i, "%2hhx", &bytes[i]);
+    }
+}
+
+esp_err_t encrypt_aes_cbc(const uint8_t *key, size_t key_len_bits, const uint8_t *iv,
+                          const uint8_t *input, size_t input_len, uint8_t *output, size_t *out_len)
+{
+    const size_t block = 16;
+    size_t pad = block - (input_len % block);
+    if (pad == 0)
+        pad = block;
+    size_t padded_len = input_len + pad;
+
+    uint8_t *padded = (uint8_t *)malloc(padded_len);
+    if (!padded)
+    {
+        ESP_LOGE(TAG, "Failed to allocate padding buffer");
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(padded, input, input_len);
+    memset(padded + input_len, pad, pad); /* PKCS#7 padding */
+
+    /* prepend IV to output buffer */
+    memcpy(output, iv, block);
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, key_len_bits);
+    esp_err_t ret = ESP_OK;
+
+    if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, (uint8_t *)iv,
+                              padded, output + block) != 0)
+    {
+        ESP_LOGE(TAG, "AES-CBC encryption failed");
+        ret = ESP_FAIL;
+    }
+    else
+    {
+        *out_len = block + padded_len;
+    }
+
+    mbedtls_aes_free(&aes);
+    free(padded);
+
+    return ret;
+}
+
+static void http_rest_with_url(void)
+{
+    char response_b64[1024];
+    size_t b64_len;
+    esp_err_t err;
+    char session_token[128] = {0};
+    char last_msg_id[25] = {0};
+
+    // Declare local_response_buffer with size (MAX_HTTP_OUTPUT_BUFFER + 1) to prevent out of bound access when
+    // it is used by functions like strlen(). The buffer should only be used upto size MAX_HTTP_OUTPUT_BUFFER
+    char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
+    /**
+     * NOTE: All the configuration parameters for http_client must be spefied either in URL or as host and path parameters.
+     * If host and path parameters are not set, query parameter will be ignored. In such cases,
+     * query parameter should be specified in URL.
+     *
+     * If URL as well as host and path parameters are specified, values of host and path will be considered.
+     */
+    esp_http_client_config_t config = {
+        .host = CONFIG_EXAMPLE_HTTP_ENDPOINT,
+        .path = "/get",
+        .query = "esp",
+        .event_handler = _http_event_handler,
+        .user_data = local_response_buffer, // Pass address of local buffer to get response
+        .disable_auto_redirect = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    bool auth_success = false;
+
+    // POST >> /auth/init
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "device_id", "esp32_001");
+    char *post_data = cJSON_PrintUnformatted(req);
+    esp_http_client_set_url(client, "http://" CONFIG_EXAMPLE_HTTP_ENDPOINT "/auth/init");
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+    err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    cJSON_Delete(req);
+    free(post_data);
+
+    if (err != ESP_OK || status != 200)
+    {
+        ESP_LOGE(TAG, "Auth init failed: %d", status);
+        goto cleanup;
+    }
+
+    // Parse challenge
+    cJSON *resp = cJSON_Parse(local_response_buffer);
+    cJSON *challenge_json = cJSON_GetObjectItem(resp, "challenge");
+    if (!challenge_json || !cJSON_IsString(challenge_json))
+    {
+        ESP_LOGE(TAG, "No challenge received");
+        cJSON_Delete(resp);
+        goto cleanup;
+    }
+
+    char challenge_hex[65];
+    strncpy(challenge_hex, challenge_json->valuestring, sizeof(challenge_hex) - 1);
+    challenge_hex[64] = '\0'; // Force a NULL terminator in case of out-of-bound access
+    ESP_LOGI(TAG, "Received challenge: %s", challenge_hex);
+    cJSON_Delete(resp);
+
+    // Compute challenge response (SHA256(PSK) -> AES256-CBC)
+    {
+        uint8_t psk_hash[32];
+        mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                   (const uint8_t *)PRESHARED_SECRET, strlen(PRESHARED_SECRET), psk_hash);
+
+        uint8_t challenge_bytes[32];
+        hex_to_bytes(challenge_hex, strlen(challenge_hex), challenge_bytes);
+
+        uint8_t iv[16];
+        for (int i = 0; i < 16; i++)
+            iv[i] = rand() % 256; // Random IV like Python
+
+        uint8_t encrypted[512];
+        size_t enc_len;
+        /* use 256-bit key length when calling */
+        if (encrypt_aes_cbc(psk_hash, 256, iv, challenge_bytes, 32, encrypted, &enc_len) != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Encryption failed");
+            goto cleanup;
+        }
+        // Base64 encode
+
+        if (mbedtls_base64_encode((uint8_t *)response_b64, sizeof(response_b64), &b64_len, encrypted, enc_len) != 0)
+        {
+            ESP_LOGE(TAG, "Base64 encode failed");
+            goto cleanup;
+        }
+        response_b64[b64_len] = '\0';
+    }
+
+    // POST >> /auth/verify
+    {
+        esp_http_client_set_url(client, "http://" CONFIG_EXAMPLE_HTTP_ENDPOINT "/auth/verify");
+        esp_http_client_set_method(client, HTTP_METHOD_POST);
+
+        cJSON *req = cJSON_CreateObject();
+        challenge_hex[64] = '\0'; // Force a NULL terminator in case of out-of-bound access
+        cJSON_AddStringToObject(req, "device_id", DEVICE_ID);
+        cJSON_AddStringToObject(req, "response", response_b64);
+        cJSON_AddStringToObject(req, "challenge", challenge_hex);
+        char *post_data = cJSON_PrintUnformatted(req);
+        ESP_LOGI(TAG, "Sending POST data: %s", post_data);
+        esp_http_client_set_post_field(client, post_data, strlen(post_data));
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+        cJSON_Delete(req);
+        free(post_data);
+
+        if (err != ESP_OK || status != 200)
+        {
+            ESP_LOGE(TAG, "Auth verify failed with status: %d err: %s", status, esp_err_to_name(err));
+            goto cleanup;
+        }
+
+        // Get session token
+        cJSON *resp = cJSON_Parse(local_response_buffer);
+        cJSON *token_json = cJSON_GetObjectItem(resp, "session_token");
+        if (token_json && cJSON_IsString(token_json))
+        {
+            strncpy(session_token, token_json->valuestring, sizeof(session_token) - 1);
+            auth_success = true;
+        }
+        cJSON_Delete(resp);
+    }
+
+    if (auth_success)
+    {
+        // Step 4: GET /messages?last_id=...
+        char url[512];
+        snprintf(url, sizeof(url), "http://" CONFIG_EXAMPLE_HTTP_ENDPOINT "/messages?last_id=%s", last_msg_id[0] ? last_msg_id : "");
+        esp_http_client_set_url(client, url);
+        esp_http_client_set_method(client, HTTP_METHOD_GET);
+
+        char auth_hdr[256];
+        snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", session_token);
+        esp_http_client_set_header(client, "Authorization", auth_hdr);
+
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+
+        ESP_LOGI(TAG, "Response buffer: %s", local_response_buffer);
+
+        if (err == ESP_OK && status == 200)
+        {
+            cJSON *msgs = cJSON_Parse(local_response_buffer);
+            cJSON *msg_array = cJSON_GetObjectItem(msgs, "messages");
+
+            if (cJSON_IsArray(msg_array))
+            {
+                int num_msgs = cJSON_GetArraySize(msg_array);
+                ESP_LOGI(TAG, "Found %d pending messages", num_msgs);
+
+                if (num_msgs > 0)
+                {
+                    // Latest message (first in sorted results)
+                    cJSON *latest = cJSON_GetArrayItem(msg_array, 0);
+                    cJSON *msgid = cJSON_GetObjectItem(latest, "_id");
+                    cJSON *payload_b64 = cJSON_GetObjectItem(latest, "payload");
+
+                    if (msgid && cJSON_IsString(msgid))
+                    {
+                        strncpy(last_msg_id, msgid->valuestring, sizeof(last_msg_id) - 1);
+                        ESP_LOGI(TAG, "📱 Latest Message ID: %s", last_msg_id);
+                    }
+
+                    if (payload_b64 && cJSON_IsString(payload_b64))
+                    {
+                        ESP_LOGI(TAG, "📦 Payload (base64): %s", payload_b64->valuestring);
+
+                        // Decode binary preview
+                        uint8_t bin_data[128];
+                        size_t bin_len;
+                        if (mbedtls_base64_decode(bin_data, sizeof(bin_data), &bin_len,
+                                                  (uint8_t *)payload_b64->valuestring,
+                                                  strlen(payload_b64->valuestring)) == 0)
+                        {
+                            ESP_LOG_BUFFER_HEX(TAG, bin_data, (bin_len > 32 ? 32 : bin_len));
+                        }
+                    }
+
+                    // ACK: PATCH /messages/{id}/ack
+                    char ack_url[512];
+                    snprintf(ack_url, sizeof(ack_url), "http://" CONFIG_EXAMPLE_HTTP_ENDPOINT "/messages/%s/ack", last_msg_id);
+                    esp_http_client_set_url(client, ack_url);
+                    esp_http_client_set_method(client, HTTP_METHOD_PATCH);
+                    esp_http_client_set_header(client, "Authorization", auth_hdr);
+                    esp_http_client_perform(client); // Fire & forget
+                    ESP_LOGI(TAG, "✅ Message acknowledged");
+                }
+            }
+            cJSON_Delete(msgs);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Messages fetch failed: %d", status);
+        }
+    }
+cleanup:
+    esp_http_client_cleanup(client);
+}
+
+static void http_test_task(void *pvParameters)
+{
+    http_rest_with_url();
+    vTaskDelete(NULL);
+}
 
 void app_main(void)
 {
@@ -602,6 +987,8 @@ void app_main(void)
 
     /* Wait for Wi-Fi connection */
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+
+    xTaskCreate(&http_test_task, "http_test_task", 8192, NULL, 5, NULL);
 
     /* Start main application now */
 #if CONFIG_EXAMPLE_REPROVISIONING
