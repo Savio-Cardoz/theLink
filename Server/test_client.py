@@ -4,17 +4,17 @@ import json
 import sys
 import time
 
-BASE_URL = "http://80.225.207.106"
+BASE_URL = "http://xxx.xxx.xxx.xxx"
 DEVICE_ID = "esp32_001"
 USER_PAYLOADS = [
-    "Hey there, how are you?",
-    "You are doing great! Keep it up!", 
-    "You are beautiful and loved! Never forget that. ❤️"
+    "Good Morning!",
+    "Sending love...", 
+    "Give your best!"
 ]
 
 def print_step(step, data=None):
     print(f"\n{'='*60}")
-    print(f"📋 STEP {step}")
+    print(f"STEP {step}")
     print(f"{'='*60}")
     if data: print(json.dumps(data, indent=2))
 
@@ -35,9 +35,9 @@ def test_auth():
     
     if resp.status_code == 200:
         session_token = resp.json()['session_token']
-        print(f"✅ Session: {session_token[:16]}...")
+        print(f"Session: {session_token[:16]}...")
         return session_token
-    print(f"❌ Auth: {resp.text}")
+    print(f"Auth: {resp.text}")
     return None
 
 def test_poll_and_cleanup(session_token):
@@ -50,11 +50,11 @@ def test_poll_and_cleanup(session_token):
     data = resp.json()
     messages = data.get('messages', [])
     
-    print(f"📨 Found {len(messages)} messages")
+    print(f"Found {len(messages)} messages")
     print(json.dumps(messages, indent=2))
     
     if not messages:
-        print("✅ No pending messages - inbox clean!")
+        print("No pending messages - inbox clean!")
         return
     
     # Ack AND Delete each message
@@ -73,7 +73,7 @@ def test_poll_and_cleanup(session_token):
         if del_resp.status_code == 200:
             deleted_count += 1
     
-    print(f"🗑️  Deleted {deleted_count}/{len(messages)} messages")
+    print(f"Deleted {deleted_count}/{len(messages)} messages")
 
 def test_send_message(device_id="esp32_001"):
     print_step(3, "Send Test Messages")
@@ -81,10 +81,10 @@ def test_send_message(device_id="esp32_001"):
         resp = requests.post(f"{BASE_URL}/send/{device_id}", 
                            json={"payload": payload, "type": "json"})
         result = resp.json()
-        print(f"📤 Sent {i}: ID={result.get('message_id')}")
+        print(f"Sent {i}: ID={result.get('message_id')}")
 
 def test_full_cycle():
-    print("🔄 Complete IoT Message Lifecycle")
+    print("Complete IoT Message Lifecycle")
     
     session_token = test_auth()
     if not session_token:
@@ -97,7 +97,7 @@ def test_full_cycle():
     # Receive + cleanup
     # test_poll_and_cleanup(session_token)
     
-    print("\n🎉 Inbox cleared! Ready for next cycle ✅")
+    print("\nInbox cleared! Ready for next cycle")
 
 if __name__ == "__main__":
     test_full_cycle()

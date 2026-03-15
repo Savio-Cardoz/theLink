@@ -10,6 +10,22 @@ from datetime import datetime, timedelta
 import json
 import logging
 
+# Load configuration from file
+try:
+    with open('config.json', 'r') as config_file:
+        config = json.load(config_file)
+    MONGO_CLIENT_URI = config['MONGO_CLIENT_URI']
+    PRESHARED_SECRET = config['PRESHARED_SECRET'].encode()
+except FileNotFoundError:
+    print("ERROR: config.json file not found. Please create it with MONGO_CLIENT_URI and PRESHARED_SECRET.")
+    exit(1)
+except KeyError as e:
+    print(f"ERROR: Missing configuration key: {e}")
+    exit(1)
+except json.JSONDecodeError:
+    print("ERROR: Invalid JSON in config.json")
+    exit(1)
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -32,7 +48,7 @@ except Exception as e:
     logger.error(f"Failed to connect to Redis: {e}")
 
 # MongoDB Connection (update for your setup)
-mongo_client = MongoClient('mongodb://admin:SecurePass123!@localhost:27017/')
+mongo_client = MongoClient(MONGO_CLIENT_URI)
 db = mongo_client['iot_db']
 messages = db.messages
 try:
@@ -42,7 +58,7 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
 
 SECRET_DB = {
-    'esp32_001': hashlib.sha256(b'your_pre_shared_secret').hexdigest()
+    'esp32_001': hashlib.sha256(PRESHARED_SECRET).hexdigest()
     # Add more devices
 }
 

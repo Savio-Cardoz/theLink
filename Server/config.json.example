@@ -1,0 +1,4 @@
+{
+    "MONGO_CLIENT_URI": "<Connection to MongoDB>",
+    "PRESHARED_SECRET": "<Shared secret for authentication>"
+}

@@ -18,6 +18,9 @@
 
 # Build artifacts and directories
 **/build/
+
+# Configuration files with sensitive information
+**/Server/config.json
 build/
 *.o
 *.a
@@ -81,3 +84,4 @@ Desktop.ini
 .vscode/
 .devcontainer/
 client_env/
+private_info/

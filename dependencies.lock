@@ -9,7 +9,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.4.1
+    version: 5.5.3
 direct_dependencies:
 - espressif/qrcode
 manifest_hash: 83219de2f187e31c82482008626ea7d97fbf805633ba6af8a24538822cb99161

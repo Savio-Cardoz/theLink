@@ -1,3 +1,120 @@
+# The Link
+
+**The Link** is an IoT messaging system that enables secure, offline-capable message delivery to ESP32-based devices with E-Ink displays. The system consists of a cloud server backend with mongoDB and an ESP32 client device that provides a reliable, low-power messaging solution.
+
+![System Demo](docs/run.gif)
+
+## Key Features
+
+- **Secure Authentication**: Implements challenge-response authentication using pre-shared secrets and AES encryption
+- **Wi-Fi Provisioning**: Supports BLE and SoftAP provisioning for easy device setup
+- **Message Persistence**: Stores received messages in ESP32 NVS (50KB allocated) for offline display
+- **Cloud Integration**: Messages are stored in MongoDB on Oracle Cloud infrastructure
+- **E-Ink Display**: 1.54-inch E-Ink display with optimized text rendering and word-wrapping
+- **Offline Capability**: Displays last received message when no new messages are available
+- **RESTful API**: HTTP-based communication between device and server with JSON payloads
+
+## System Architecture
+
+![System Architecture](docs/Diagram.jpg)
+
+- **Server**: Python Flask application running on Oracle Cloud with MongoDB storage
+- **Client**: ESP32 microcontroller with E-Ink display and Wi-Fi connectivity
+- **Communication**: Secure HTTP requests with bearer token authentication
+- **Display**: Custom word-wrapping algorithm ensures clean text presentation
+
+The device automatically loads stored messages at startup and fetches new messages from the cloud, providing a seamless messaging experience even in intermittent connectivity scenarios.
+
+# Getting started
+
+## Prerequisites
+- ESP-IDF v5.5.3 or later
+- Python 3.10 or later
+- ESP32 development board with 1.54inch E-Ink display
+- Oracle Cloud server with MongoDB for message storage
+
+## Hardware Setup
+
+![Hardware Setup](docs/Screenshot%20from%202026-03-16%2000-38-38.png)
+
+- Connect the E-Ink display to the ESP32 according to the pinout in `main/app_main.cpp`
+- Ensure the ESP32 is connected to a power source and USB for flashing
+
+## Server Setup
+- Deploy the server code in `Server/` to an Oracle Cloud instance, I've used a ubuntu vm
+- Copy `Server/config.json.example` to `Server/config.json` and update with your MongoDB URI and pre-shared secret
+- Install Python dependencies: `pip install -r Server/server_requirements.txt`
+- Configure MongoDB for message storage
+- Update the server endpoint in `main/app_main.cpp` if necessary
+- Config NGINX to forward requests on 80 to the application
+```
+server {
+    listen 80;
+    server_name _;
+    
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+# How to build and run
+
+## Building the ESP32 Firmware
+1. Install ESP-IDF and set up the environment
+2. Navigate to the project directory: `cd /path/to/theLink`
+3. Configure the project: `idf.py menuconfig`
+   - Set Wi-Fi provisioning options
+   - Configure server endpoint under "Example Configuration"
+4. Build the project: `idf.py build`
+5. Flash to ESP32: `idf.py -p /dev/ttyUSB0 flash`
+6. Monitor the output: `idf.py -p /dev/ttyUSB0 monitor`
+
+## Running the Server
+1. On your Oracle Cloud instance, create a python virtual environment.
+2. Activate the virtual environment and install Python dependencies: `pip install -r requirements.txt`
+3. Setup the config.json file with the MONGODB connection and a Pre-shared secret
+4. Run the authentication server: `python auth.py`
+5. The server will listen for ESP32 connections and message requests
+6. Test the server with the `test_client.py` script.
+
+## Device Operation
+- On first boot, the ESP32 will enter provisioning mode. I have used the SoftAP mode.
+- Use the provisioning app from espressif to connect to Wi-Fi AP created by the ESP32. You may have to enable softAP configuration in the apps settings.
+- The provisioning key is `abcd1234`. 
+- Once provisioned, the device will periodically check for new messages
+- Messages are displayed on the E-Ink display
+- Stored messages are loaded at startup if no new messages are available
+
+# How to test
+## Test message transmission
+- Run the script `test_client.py` to connect and send messages to the server. The client tests the complete process of authentication and message transmission.
+- Flash the ESP32, it should run and GET messages from the server. This message is parsed and the message should be displayed
+
+## Testing Steps
+1. Start the server: `python Server/auth.py`
+2. Send a test message: `python Server/test_client.py`
+3. Verify the message is stored in MongoDB
+4. Power on the ESP32 and provision Wi-Fi
+5. Check the E-Ink display for the received message
+6. Test offline functionality: Power cycle the ESP32 without new messages - it should display the last stored message
+
+## Troubleshooting
+- If provisioning fails, check BLE/SoftAP configuration in menuconfig
+- If messages don't display, verify the server endpoint and authentication
+- Check serial logs for error messages
+
+# TODO
+- Currently all messages in the DB are being returned to the device. This will lead to memory shortage if too many messages pile up. Read only a single message from the server.
+- Add ability to send a 200x200 array to display images
+
+# Note:
+**This application was built on top of the WiFi Prov example from the ESP-IDF directory, I'm including the information from that example down below**
+
 | Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-S2 | ESP32-S3 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- |
 
@@ -407,5 +524,6 @@ BLECLI >> Enter data read from characteristic (in hex) :
 ```
 
 The write data is to be copied from the console output ```>>``` to the platform specific application and the data read from the application is to be pasted at the user input prompt ```<<``` of the console, in the format (hex) indicated in above sample log.
-#   t h e L i n k  
+#   t h e L i n k 
+ 
  

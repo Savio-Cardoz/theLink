@@ -1,10 +1,16 @@
 menu "Example Configuration"
 
-    config EXAMPLE_HTTP_ENDPOINT
-        string "Example HTTP Endpoint"
-        default "80.225.207.106"
+    config HTTP_ENDPOINT
+        string "HTTP Endpoint"
+        default "xxx.xxx.xxx.xxx"
         help
             Target endpoint host-name for the example to use.
+    
+    config SHARED_SECRET
+        string "Shared Secret"
+        default "Shared Secret for authentication"
+        help
+            Shared secret for authentication with the server. This should match the pre-shared secret configured on the server side for the device.
 
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
