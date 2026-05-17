@@ -703,7 +703,7 @@ static void http_rest_with_url(void)
 
                     if (payload_b64 && cJSON_IsString(payload_b64))
                     {
-                        ESP_LOGI(TAG, "Payload (base64): %s, length %lu", payload_b64->valuestring, strlen(payload_b64->valuestring));
+                        ESP_LOGI(TAG, "Payload (base64): %s", payload_b64->valuestring);
 
                         char *msg = strdup(payload_b64->valuestring);
                         ESP_LOGI(TAG, "Message Queued: %s", msg);
