@@ -1,2 +1,6 @@
 dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
   qrcode: "^0.1.0"
+  lvgl/lvgl: ^9.3.0

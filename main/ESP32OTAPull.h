@@ -4,6 +4,8 @@ updates, where the image updates are posted on the web.
 
 MIT License
 
+Copyright (c) 2026 Savio Cardoz
+
 Copyright (c) 2022-25 Mikal Hart
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,6 +29,7 @@ SOFTWARE.
 
 #pragma once
 #include <HTTPClient.h>
+#include "esp_http_client.h"
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <WiFi.h>

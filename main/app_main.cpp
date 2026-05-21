@@ -23,6 +23,12 @@
 #include <wifi_provisioning/manager.h>
 #include <driver/gpio.h>
 
+#include "user_app.h"
+#include "lvgl.h"
+#include "user_config.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
 #include <wifi_provisioning/scheme_ble.h>
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
@@ -64,6 +70,38 @@ int8_t is_on_after_ble_stop = 1;
 #define ESP_INTR_FLAG_DEFAULT 0
 
 static esp_err_t save_message_to_nvs(const char *message);
+
+static SemaphoreHandle_t lvgl_mux = NULL;
+
+#define BYTES_PER_PIXEL (LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565))
+#define BUFF_SIZE (EPD_WIDTH * EPD_HEIGHT * BYTES_PER_PIXEL)
+
+/*lvgl tset unlock*/
+static bool example_lvgl_lock(int timeout_ms);
+static void example_lvgl_unlock(void);
+static void example_lvgl_port_task(void *arg);
+
+static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
+{
+    uint16_t *buffer = (uint16_t *)color_p;
+    driver->EPD_Clear();
+    for (int y = area->y1; y <= area->y2; y++)
+    {
+        for (int x = area->x1; x <= area->x2; x++)
+        {
+            uint8_t color = (*buffer < 0x7fff) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
+            driver->EPD_DrawColorPixel(x, y, color);
+            buffer++;
+        }
+    }
+    driver->EPD_DisplayPart();
+    lv_disp_flush_ready(disp);
+}
+
+static void example_increase_lvgl_tick(void *arg)
+{
+    lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
+}
 
 /* GPIO interrupt handler - called from ISR context */
 static void IRAM_ATTR gpio_isr_handler(void *arg)
@@ -815,19 +853,47 @@ static char *load_message_from_nvs(void)
 
 extern "C" void app_main(void)
 {
-    Epd epd;
+    // Epd epd;
 
-    unsigned char *frame = (unsigned char *)malloc(epd.width * epd.height / 8);
-    unsigned char *frame_ = (unsigned char *)malloc(epd.width * epd.height / 8);
+    // unsigned char *frame = (unsigned char *)malloc(epd.width * epd.height / 8);
+    // unsigned char *frame_ = (unsigned char *)malloc(epd.width * epd.height / 8);
 
-    Paint paint(frame, epd.width, epd.height);
-    Paint paint_(frame_, epd.width, epd.height);
-    paint.Clear(UNCOLORED);
-    paint_.Clear(UNCOLORED);
+    // Paint paint(frame, epd.width, epd.height);
+    // Paint paint_(frame_, epd.width, epd.height);
+    // paint.Clear(UNCOLORED);
+    // paint_.Clear(UNCOLORED);
 
-    ESP_LOGI("EPD", "e-Paper init and clear");
-    epd.LDirInit();
-    epd.Clear();
+    // ESP_LOGI("EPD", "e-Paper init and clear");
+    // epd.LDirInit();
+    // epd.Clear();
+    // paint.DrawStringAt(10, 10, "Hello world!", &Font12, COLORED);
+    // epd.DisplayFrame();
+
+    user_app_init();
+    lv_init();
+    lv_display_t *disp = lv_display_create(EPD_WIDTH, EPD_HEIGHT);
+    lv_display_set_flush_cb(disp, example_lvgl_flush_cb);
+    uint8_t *buffer_1 = NULL;
+    buffer_1 = (uint8_t *)heap_caps_malloc(BUFF_SIZE, MALLOC_CAP_SPIRAM);
+    assert(buffer_1);
+    lv_display_set_buffers(disp, buffer_1, NULL, BUFF_SIZE, LV_DISPLAY_RENDER_MODE_FULL);
+
+    ESP_LOGI(TAG, "Install LVGL tick timer");
+    esp_timer_create_args_t lvgl_tick_timer_args = {};
+    lvgl_tick_timer_args.callback = &example_increase_lvgl_tick;
+    lvgl_tick_timer_args.name = "lvgl_tick";
+    esp_timer_handle_t lvgl_tick_timer = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
+
+    lvgl_mux = xSemaphoreCreateMutex();
+    assert(lvgl_mux);
+    xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8 * 1024, NULL, 4, NULL, 1);
+    if (example_lvgl_lock(-1))
+    {
+        user_ui_init();
+        example_lvgl_unlock();
+    }
 
     msg_queue = xQueueCreate(10, sizeof(char *));
 
@@ -1125,13 +1191,47 @@ extern "C" void app_main(void)
         {
             ESP_LOGI(TAG, "Received message from queue: %s", msg);
             // Display on EPD
-            paint.Clear(UNCOLORED);
-            paint.DrawStringAtWithMaxWidth(10, 10, msg, &Font24, COLORED, epd.width);
-            epd.SetFrameMemory(paint.GetImage(), 0, 0, paint.GetWidth(), paint.GetHeight());
-            epd.DisplayFrame();
+            // paint.Clear(UNCOLORED);
+            // // paint.DrawStringAtWithMaxWidth(10, 10, msg, &Font24, COLORED, epd.width);
+            // epd.SetFrameMemory(paint.GetImage(), 0, 0, paint.GetWidth(), paint.GetHeight());
+            // epd.DisplayFrame();
             free(msg);
         }
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 #endif
+}
+
+static bool example_lvgl_lock(int timeout_ms)
+{
+    const TickType_t timeout_ticks = (timeout_ms == -1) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
+}
+
+static void example_lvgl_unlock(void)
+{
+    assert(lvgl_mux && "bsp_display_start must be called first");
+    xSemaphoreGive(lvgl_mux);
+}
+static void example_lvgl_port_task(void *arg)
+{
+    uint32_t task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
+    for (;;)
+    {
+        if (example_lvgl_lock(-1))
+        {
+            task_delay_ms = lv_timer_handler();
+            // Release the mutex
+            example_lvgl_unlock();
+        }
+        if (task_delay_ms > EXAMPLE_LVGL_TASK_MAX_DELAY_MS)
+        {
+            task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
+        }
+        else if (task_delay_ms < EXAMPLE_LVGL_TASK_MIN_DELAY_MS)
+        {
+            task_delay_ms = EXAMPLE_LVGL_TASK_MIN_DELAY_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+    }
 }
