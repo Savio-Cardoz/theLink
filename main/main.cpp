@@ -1,3 +1,5 @@
+
+
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "user_app.h"
@@ -17,6 +19,27 @@
 #include <network_provisioning/manager.h>
 #include <network_provisioning/scheme_ble.h>
 #include "qrcode.h"
+
+#include "mqtt_client.h"
+
+#include "freertos/queue.h"
+#include "cJSON.h" // Strongly recommended for parsing the MQTT payload
+// External reference to the class we built in the previous step
+// Make sure you include the header where AsyncDownloader is defined
+#include "data_downloader.hpp"
+
+#define MAX_URL_LEN 256
+#define MAX_FILE_LEN 64
+
+// The structure passed through the FreeRTOS Queue
+typedef struct
+{
+	char url[MAX_URL_LEN];
+	char filename[MAX_FILE_LEN];
+} DownloadCommand_t;
+
+// Global Handle for the Queue
+static QueueHandle_t download_cmd_queue = NULL;
 
 static const char *TAG = "app";
 
@@ -59,6 +82,14 @@ static const char sec2_verifier[] = {
 	0xe6, 0xf6, 0x53, 0xc8, 0x31, 0xa8, 0x78, 0xde, 0x50, 0x40, 0xf7, 0x62, 0xde, 0x36, 0xb2, 0xba};
 
 #endif
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+	if (error_code != 0)
+	{
+		ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+	}
+}
 
 static esp_err_t example_get_sec2_salt(const char **salt, uint16_t *salt_len)
 {
@@ -131,6 +162,40 @@ static EventGroupHandle_t wifi_event_group;
 #define QRCODE_BASE_URL "https://espressif.github.io/esp-jumpstart/qrcode.html"
 
 /* Event handler for catching system events */
+
+static void download_orchestrator_task(void *arg)
+{
+	ESP_LOGI(TAG, "Download Orchestrator Task Started");
+
+	AsyncDownloader downloader;
+	DownloadCommand_t incoming_cmd;
+
+	for (;;)
+	{
+		// Block indefinitely until a command arrives in the queue
+		if (xQueueReceive(download_cmd_queue, &incoming_cmd, portMAX_DELAY) == pdTRUE)
+		{
+			ESP_LOGI(TAG, "Orchestrator received request: URL=%s, Target=%s",
+					 incoming_cmd.url, incoming_cmd.filename);
+
+			// Convert standard C arrays to std::string for the C++ class
+			std::string urlStr(incoming_cmd.url);
+			std::string fileStr(incoming_cmd.filename);
+
+			// Trigger the download
+			bool success = downloader.startDownload(urlStr, fileStr);
+
+			if (!success)
+			{
+				ESP_LOGE(TAG, "Failed to start download. Is one already active?");
+			}
+
+			// Note: startDownload spawns its own FreeRTOS tasks and returns immediately.
+			// If you only want one download at a time, you may need to add logic here
+			// to wait until the downloader signals completion before accepting the next queue item.
+		}
+	}
+}
 static void event_handler(void *arg, esp_event_base_t event_base,
 						  int32_t event_id, void *event_data)
 {
@@ -248,6 +313,168 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 			break;
 		}
 	}
+}
+
+/*
+ * @brief Event handler registered to receive MQTT events
+ *
+ *  This function is called by the MQTT client event loop.
+ *
+ * @param handler_args user data registered to the event.
+ * @param base Event base for the handler(always MQTT Base in this example).
+ * @param event_id The id for the received event.
+ * @param event_data The data for the event, esp_mqtt_event_handle_t.
+ */
+static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+	ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
+	esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+	esp_mqtt_client_handle_t client = event->client;
+	int msg_id;
+
+	ESP_LOGD(TAG, "free heap size is %" PRIu32 ", minimum %" PRIu32, esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+	switch ((esp_mqtt_event_id_t)event_id)
+	{
+	case MQTT_EVENT_CONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+		msg_id = esp_mqtt_client_subscribe(client, "/cardoz/command_in", 2);
+		ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+		break;
+	case MQTT_EVENT_DISCONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+		break;
+	case MQTT_EVENT_SUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_UNSUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_PUBLISHED:
+		ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_DATA:
+	{
+		ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+		ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+		ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
+
+		// Ensure the payload is null-terminated for parsing
+		char *payload = (char *)malloc(event->data_len + 1);
+		if (payload)
+		{
+			memcpy(payload, event->data, event->data_len);
+			payload[event->data_len] = '\0';
+
+			// Example using cJSON to extract data (assuming payload is JSON)
+			// e.g., {"url": "https://server.com/file.bin", "file": "/sdcard/file.bin"}
+			cJSON *json = cJSON_Parse(payload);
+			if (json != NULL && download_cmd_queue != NULL)
+			{
+				cJSON *url_item = cJSON_GetObjectItemCaseSensitive(json, "url");
+				cJSON *file_item = cJSON_GetObjectItemCaseSensitive(json, "file");
+
+				if (cJSON_IsString(url_item) && cJSON_IsString(file_item))
+				{
+					DownloadCommand_t cmd;
+					memset(&cmd, 0, sizeof(DownloadCommand_t));
+
+					// strncpy(cmd.url, url_item->valuestring, MAX_URL_LEN - 1);
+					// strncpy(cmd.filename, file_item->valuestring, MAX_FILE_LEN - 1);
+
+					strncpy(cmd.url, "http://80.225.207.106/esp32_images/updates.json", MAX_URL_LEN - 1);
+					strncpy(cmd.filename, "/sdcard/updates.json", MAX_FILE_LEN - 1);
+
+					// Push to queue without blocking (timeout = 0)
+					if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
+					{
+						ESP_LOGE(TAG, "Download queue is full! Dropping command.");
+					}
+					else
+					{
+						ESP_LOGI(TAG, "Download command enqueued successfully.");
+					}
+				}
+				cJSON_Delete(json);
+			}
+			free(payload);
+		}
+		break;
+	}
+	case MQTT_EVENT_ERROR:
+		ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+		ESP_LOGI(TAG, "MQTT5 return code is %d", event->error_handle->connect_return_code);
+		break;
+	case MQTT_EVENT_BEFORE_CONNECT:
+	case MQTT_EVENT_DELETED:
+	case MQTT_EVENT_ANY:
+	case MQTT_USER_EVENT:
+	default:
+		ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+		break;
+	}
+}
+
+static void mqtt5_app_start(void)
+{
+	esp_mqtt_client_config_t mqtt5_cfg = {};
+	mqtt5_cfg.broker.address.uri = CONFIG_BROKER_URL;
+	// mqtt5_cfg.credentials.username = "123";
+	// mqtt5_cfg.credentials.authentication.password = "456";
+	mqtt5_cfg.session.last_will.topic = "/topic/will";
+	mqtt5_cfg.session.last_will.msg = "i will leave";
+	mqtt5_cfg.session.last_will.msg_len = 12;
+	mqtt5_cfg.session.last_will.qos = 1;
+	mqtt5_cfg.session.last_will.retain = true;
+	mqtt5_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+
+#if CONFIG_BROKER_URL_FROM_STDIN
+	char line[128];
+
+	if (strcmp(mqtt5_cfg.uri, "FROM_STDIN") == 0)
+	{
+		int count = 0;
+		printf("Please enter url of mqtt broker\n");
+		while (count < 128)
+		{
+			int c = fgetc(stdin);
+			if (c == '\n')
+			{
+				line[count] = '\0';
+				break;
+			}
+			else if (c > 0 && c < 127)
+			{
+				line[count] = c;
+				++count;
+			}
+			vTaskDelay(10 / portTICK_PERIOD_MS);
+		}
+		mqtt5_cfg.broker.address.uri = line;
+		printf("Broker url: %s\n", line);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Configuration mismatch: wrong broker url");
+		abort();
+	}
+#endif /* CONFIG_BROKER_URL_FROM_STDIN */
+
+	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
+
+	/* Set connection properties and user properties */
+	// esp_mqtt5_client_set_user_property(&connect_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+	// esp_mqtt5_client_set_user_property(&connect_property.will_user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+	// esp_mqtt5_client_set_connect_property(client, &connect_property);
+
+	/* If you call esp_mqtt5_client_set_user_property to set user properties, DO NOT forget to delete them.
+	 * esp_mqtt5_client_set_connect_property will malloc buffer to store the user_property and you can delete it after
+	 */
+	// esp_mqtt5_client_delete_user_property(connect_property.user_property);
+	// esp_mqtt5_client_delete_user_property(connect_property.will_user_property);
+
+	/* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+	esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt5_event_handler, NULL);
+	esp_mqtt_client_start(client);
 }
 
 static void wifi_init_sta(void)
@@ -414,230 +641,6 @@ extern "C" void app_main(void)
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-	// 	/* Configuration for the provisioning manager */
-	// 	network_prov_mgr_config_t config = {
-	// 	/* What is the Provisioning Scheme that we want ?
-	// 	 * network_prov_scheme_softap or network_prov_scheme_ble */
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
-	// 		.scheme = network_prov_scheme_ble,
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
-	// 		.scheme = network_prov_scheme_softap,
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
-	// #ifdef CONFIG_EXAMPLE_PROV_ENABLE_APP_CALLBACK
-	// 		.app_event_handler = wifi_prov_event_handler,
-	// #endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
-
-	// 	/* Any default scheme specific event handler that you would
-	// 	 * like to choose. Since our example application requires
-	// 	 * neither BT nor BLE, we can choose to release the associated
-	// 	 * memory once provisioning is complete, or not needed
-	// 	 * (in case when device is already provisioned). Choosing
-	// 	 * appropriate scheme specific event handler allows the manager
-	// 	 * to take care of this automatically. This can be set to
-	// 	 * NETWORK_PROV_EVENT_HANDLER_NONE when using network_prov_scheme_softap*/
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
-	// 		.scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
-	// 		.scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE,
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
-	// #ifdef CONFIG_EXAMPLE_RESET_PROV_MGR_ON_FAILURE
-	// 		.network_prov_wifi_conn_cfg = {
-	// 			.wifi_conn_attempts = CONFIG_EXAMPLE_PROV_MGR_CONNECTION_CNT}
-	// #endif
-	// 	};
-
-	// 	/* Initialize provisioning manager with the
-	// 	 * configuration parameters set above */
-	// 	ESP_ERROR_CHECK(network_prov_mgr_init(config));
-
-	// 	bool provisioned = false;
-	// #ifdef CONFIG_EXAMPLE_RESET_PROVISIONED
-	// 	network_prov_mgr_reset_wifi_provisioning();
-	// #else
-	// 	/* Let's find out if the device is provisioned */
-	// 	ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
-
-	// #endif
-	// 	/* If device is not yet provisioned start provisioning service */
-	// 	if (!provisioned)
-	// 	{
-	// 		ESP_LOGI(TAG, "Starting provisioning");
-
-	// 		/* What is the Device Service Name that we want
-	// 		 * This translates to :
-	// 		 *     - Wi-Fi SSID when scheme is network_prov_scheme_softap
-	// 		 *     - device name when scheme is network_prov_scheme_ble
-	// 		 */
-	// 		char service_name[12];
-	// 		get_device_service_name(service_name, sizeof(service_name));
-
-	// #ifdef CONFIG_EXAMPLE_PROV_SECURITY_VERSION_1
-	// 		/* What is the security level that we want (0, 1, 2):
-	// 		 *      - NETWORK_PROV_SECURITY_0 is simply plain text communication.
-	// 		 *      - NETWORK_PROV_SECURITY_1 is secure communication which consists of secure handshake
-	// 		 *          using X25519 key exchange and proof of possession (pop) and AES-CTR
-	// 		 *          for encryption/decryption of messages.
-	// 		 *      - NETWORK_PROV_SECURITY_2 SRP6a based authentication and key exchange
-	// 		 *        + AES-GCM encryption/decryption of messages
-	// 		 */
-	// 		network_prov_security_t security = NETWORK_PROV_SECURITY_1;
-
-	// 		/* Do we want a proof-of-possession (ignored if Security 0 is selected):
-	// 		 *      - this should be a string with length > 0
-	// 		 *      - NULL if not used
-	// 		 */
-	// 		const char *pop = "abcd1234";
-
-	// 		/* This is the structure for passing security parameters
-	// 		 * for the protocomm security 1.
-	// 		 */
-	// 		network_prov_security1_params_t *sec_params = pop;
-
-	// 		const char *username = NULL;
-
-	// #elif CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
-	// 		network_prov_security_t security = NETWORK_PROV_SECURITY_2;
-	// 		/* The username must be the same one, which has been used in the generation of salt and verifier */
-
-	// #if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
-	// 		/* This pop field represents the password that will be used to generate salt and verifier.
-	// 		 * The field is present here in order to generate the QR code containing password.
-	// 		 * In production this password field shall not be stored on the device */
-	// 		const char *username = PROV_SEC2_USERNAME;
-	// 		const char *pop = PROV_SEC2_PWD;
-	// #elif CONFIG_EXAMPLE_PROV_SEC2_PROD_MODE
-	// 		/* The username and password shall not be embedded in the firmware,
-	// 		 * they should be provided to the user by other means.
-	// 		 * e.g. QR code sticker */
-	// 		const char *username = NULL;
-	// 		const char *pop = NULL;
-	// #endif
-	// 		/* This is the structure for passing security parameters
-	// 		 * for the protocomm security 2.
-	// 		 * If dynamically allocated, sec2_params pointer and its content
-	// 		 * must be valid till NETWORK_PROV_END event is triggered.
-	// 		 */
-	// 		network_prov_security2_params_t sec2_params = {};
-
-	// 		ESP_ERROR_CHECK(example_get_sec2_salt(&sec2_params.salt, &sec2_params.salt_len));
-	// 		ESP_ERROR_CHECK(example_get_sec2_verifier(&sec2_params.verifier, &sec2_params.verifier_len));
-
-	// 		network_prov_security2_params_t *sec_params = &sec2_params;
-	// #endif
-	// 		/* What is the service key (could be NULL)
-	// 		 * This translates to :
-	// 		 *     - Wi-Fi password when scheme is network_prov_scheme_softap
-	// 		 *          (Minimum expected length: 8, maximum 64 for WPA2-PSK)
-	// 		 *     - simply ignored when scheme is network_prov_scheme_ble
-	// 		 */
-	// 		const char *service_key = NULL;
-
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
-	// 		/* This step is only useful when scheme is network_prov_scheme_ble. This will
-	// 		 * set a custom 128 bit UUID which will be included in the BLE advertisement
-	// 		 * and will correspond to the primary GATT service that provides provisioning
-	// 		 * endpoints as GATT characteristics. Each GATT characteristic will be
-	// 		 * formed using the primary service UUID as base, with different auto assigned
-	// 		 * 12th and 13th bytes (assume counting starts from 0th byte). The client side
-	// 		 * applications must identify the endpoints by reading the User Characteristic
-	// 		 * Description descriptor (0x2901) for each characteristic, which contains the
-	// 		 * endpoint name of the characteristic */
-	// 		uint8_t custom_service_uuid[] = {
-	// 			/* LSB <---------------------------------------
-	// 			 * ---------------------------------------> MSB */
-	// 			0xb4,
-	// 			0xdf,
-	// 			0x5a,
-	// 			0x1c,
-	// 			0x3f,
-	// 			0x6b,
-	// 			0xf4,
-	// 			0xbf,
-	// 			0xea,
-	// 			0x4a,
-	// 			0x82,
-	// 			0x03,
-	// 			0x04,
-	// 			0x90,
-	// 			0x1a,
-	// 			0x02,
-	// 		};
-
-	// 		/* If your build fails with linker errors at this point, then you may have
-	// 		 * forgotten to enable the BT stack or BTDM BLE settings in the SDK (e.g. see
-	// 		 * the sdkconfig.defaults in the example project) */
-	// 		network_prov_scheme_ble_set_service_uuid(custom_service_uuid);
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
-
-	// 		/* An optional endpoint that applications can create if they expect to
-	// 		 * get some additional custom data during provisioning workflow.
-	// 		 * The endpoint name can be anything of your choice.
-	// 		 * This call must be made before starting the provisioning.
-	// 		 */
-	// 		network_prov_mgr_endpoint_create("custom-data");
-
-	// 		/* Do not stop and de-init provisioning even after success,
-	// 		 * so that we can restart it later. */
-	// #ifdef CONFIG_EXAMPLE_REPROVISIONING
-	// 		network_prov_mgr_disable_auto_stop(1000);
-	// #endif
-	// 		/* Start provisioning service */
-	// 		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(security, (const void *)sec_params, service_name, service_key));
-
-	// 		/* The handler for the optional endpoint created above.
-	// 		 * This call must be made after starting the provisioning, and only if the endpoint
-	// 		 * has already been created above.
-	// 		 */
-	// 		network_prov_mgr_endpoint_register("custom-data", custom_prov_data_handler, NULL);
-
-	// 		/* Uncomment the following to wait for the provisioning to finish and then release
-	// 		 * the resources of the manager. Since in this case de-initialization is triggered
-	// 		 * by the default event loop handler, we don't need to call the following */
-	// 		// network_prov_mgr_wait();
-	// 		// network_prov_mgr_deinit();
-	// 		/* Print QR code for provisioning */
-	// #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
-	// 		wifi_prov_print_qr(service_name, username, pop, PROV_TRANSPORT_BLE);
-	// #else  /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
-	// 		wifi_prov_print_qr(service_name, username, pop, PROV_TRANSPORT_SOFTAP);
-	// #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
-	// 	}
-	// 	else
-	// 	{
-	// 		ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
-
-	// 		/* We don't need the manager as device is already provisioned,
-	// 		 * so let's release it's resources */
-	// 		ESP_ERROR_CHECK(network_prov_mgr_deinit());
-
-	// 		ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-	// 		/* Start Wi-Fi station */
-	// 		wifi_init_sta();
-	// 	}
-
-	// 	/* Wait for Wi-Fi connection */
-	// 	xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
-
-	// 	/* Start main application now */
-	// #if CONFIG_EXAMPLE_REPROVISIONING
-	// 	while (1)
-	// 	{
-	// 		for (int i = 0; i < 10; i++)
-	// 		{
-	// 			ESP_LOGI(TAG, "Hello World!");
-	// 			vTaskDelay(1000 / portTICK_PERIOD_MS);
-	// 		}
-
-	// 		/* Resetting provisioning state machine to enable re-provisioning */
-	// 		network_prov_mgr_reset_wifi_sm_state_for_reprovision();
-
-	// 		/* Wait for Wi-Fi connection */
-	// 		xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
-	// 	}
-	// #endif
-
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8 * 1024, NULL, 4, NULL, 1);
 	if (example_lvgl_lock(-1))
@@ -658,6 +661,7 @@ static void example_lvgl_unlock(void)
 	assert(lvgl_mux && "bsp_display_start must be called first");
 	xSemaphoreGive(lvgl_mux);
 }
+
 static void example_lvgl_port_task(void *arg)
 {
 	uint32_t task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
@@ -906,6 +910,25 @@ static void wifi_prov_task(void *arg)
 		xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
 	}
 #else
+
+	// 1. Create the Queue (holds up to 5 commands)
+	download_cmd_queue = xQueueCreate(5, sizeof(DownloadCommand_t));
+	if (download_cmd_queue == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to create download queue!");
+		abort();
+	}
+
+	// 2. Spawn the Orchestrator Task
+	xTaskCreate(download_orchestrator_task,
+				"DlOrchestrator",
+				4096,
+				NULL,
+				3, // Priority (lower than network, higher than idle)
+				NULL);
+
+	mqtt5_app_start();
+
 	while (1)
 	{
 		ESP_LOGI(TAG, "Hello World!");

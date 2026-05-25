@@ -1,5 +1,15 @@
 menu "Example Configuration"
 
+    config BROKER_URL
+        string "Broker URL"
+        default "mqtt://mqtt.eclipseprojects.io"
+        help
+            URL of the broker to connect to
+
+    config BROKER_URL_FROM_STDIN
+        bool
+        default y if BROKER_URL = "FROM_STDIN"
+    
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
         default EXAMPLE_PROV_TRANSPORT_SOFTAP if IDF_TARGET_ESP32S2
