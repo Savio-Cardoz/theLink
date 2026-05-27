@@ -1,2 +1,3 @@
 idf_component_register(SRCS "data_downloader.cpp" "main.cpp"
-                    INCLUDE_DIRS "./")
+                    INCLUDE_DIRS "./"
+                    REQUIRES sdcard_manager esp_http_client user_app nvs_flash mqtt json)

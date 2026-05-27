@@ -28,6 +28,9 @@
 // Make sure you include the header where AsyncDownloader is defined
 #include "data_downloader.hpp"
 
+#include "sdcard_manager.hpp"
+#include "user_config.h"
+
 #define MAX_URL_LEN 256
 #define MAX_FILE_LEN 64
 
@@ -586,6 +589,26 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
 extern "C" void app_main(void)
 {
 	user_app_init();
+
+	SDCardConfig sd_config;
+	sd_config.mountPoint = "/sdcard";
+	sd_config.maxOpenFiles = 5;
+	sd_config.allocationUnitSize = 16 * 1024;
+	sd_config.pinCmd = SDMMC_CMD_PIN;
+	sd_config.pinClk = SDMMC_CLK_PIN;
+	sd_config.pinD0 = SDMMC_D0_PIN;
+
+	IFileSystem *sdcard = new SDCardManager(sd_config);
+	std::string fileContent;
+
+	if (sdcard->mount())
+	{
+		ESP_LOGI(TAG, "SD card mounted successfully. You can now perform file operations.");
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to mount SD card. Check the connections and try again.");
+	}
 
 	lv_init();
 	lv_display_t *disp = lv_display_create(EPD_WIDTH, EPD_HEIGHT); /* 以水平和垂直分辨率（像素）进行基本初始化 */
