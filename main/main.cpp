@@ -41,6 +41,25 @@ typedef struct
 	char filename[MAX_FILE_LEN];
 } DownloadCommand_t;
 
+typedef struct instructions_struct
+{
+	bool active;
+	std::string data_path;
+	uint32_t run_interval;
+	bool repeat;
+	std::string message;
+} instructions_t;
+
+instructions_t display_instructions;
+instructions_t rgb_instructions;
+instructions_t audio_instructions;
+instructions_t notification_instructions;
+
+TaskHandle_t display_task_handle = NULL;
+TaskHandle_t rgb_task_handle = NULL;
+TaskHandle_t audio_task_handle = NULL;
+TaskHandle_t notification_task_handle = NULL;
+
 // Global Handle for the Queue
 static QueueHandle_t download_cmd_queue = NULL;
 
@@ -340,7 +359,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 	{
 	case MQTT_EVENT_CONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-		msg_id = esp_mqtt_client_subscribe(client, "/cardoz/command_in", 2);
+		msg_id = esp_mqtt_client_subscribe(client, CONFIG_COMMAND_TOPIC, 2);
 		ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 		break;
 	case MQTT_EVENT_DISCONNECTED:
@@ -363,46 +382,90 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 
 		// Ensure the payload is null-terminated for parsing
 		char *payload = (char *)malloc(event->data_len + 1);
-		if (payload)
+		if (payload == NULL)
 		{
-			memcpy(payload, event->data, event->data_len);
-			payload[event->data_len] = '\0';
-
-			// Example using cJSON to extract data (assuming payload is JSON)
-			// e.g., {"url": "https://server.com/file.bin", "file": "/sdcard/file.bin"}
-			cJSON *json = cJSON_Parse(payload);
-			if (json != NULL && download_cmd_queue != NULL)
-			{
-				cJSON *url_item = cJSON_GetObjectItemCaseSensitive(json, "url");
-				cJSON *file_item = cJSON_GetObjectItemCaseSensitive(json, "file");
-
-				if (cJSON_IsString(url_item) && cJSON_IsString(file_item))
-				{
-					DownloadCommand_t cmd;
-					memset(&cmd, 0, sizeof(DownloadCommand_t));
-
-					// strncpy(cmd.url, url_item->valuestring, MAX_URL_LEN - 1);
-					// strncpy(cmd.filename, file_item->valuestring, MAX_FILE_LEN - 1);
-
-					strncpy(cmd.url, "http://80.225.207.106/esp32_images/updates.json", MAX_URL_LEN - 1);
-					strncpy(cmd.filename, "/sdcard/updates.json", MAX_FILE_LEN - 1);
-
-					// Push to queue without blocking (timeout = 0)
-					if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
-					{
-						ESP_LOGE(TAG, "Download queue is full! Dropping command.");
-					}
-					else
-					{
-						ESP_LOGI(TAG, "Download command enqueued successfully.");
-					}
-				}
-				cJSON_Delete(json);
-			}
-			free(payload);
+			ESP_LOGE(TAG, "Failed to allocate memory for payload");
+			return;
 		}
-		break;
+
+		memcpy(payload, event->data, event->data_len);
+		payload[event->data_len] = '\0';
+
+		/* Parse JSON and pass to be processed based on command */
+		cJSON *json = cJSON_Parse(payload);
+		if (json == NULL)
+		{
+			ESP_LOGE(TAG, "Failed to parse JSON payload");
+			free(payload);
+			return;
+		}
+
+		// cJSON *command_item = cJSON_GetObjectItemCaseSensitive(json, "command");
+		// if (!cJSON_IsString(command_item) || (command_item->valuestring == NULL))
+		// {
+		// 	ESP_LOGE(TAG, "Invalid or missing 'command' field in JSON");
+		// 	cJSON_Delete(json);
+		// 	free(payload);
+		// 	return;
+		// }
+
+		cJSON *module_item = cJSON_GetObjectItemCaseSensitive(json, "module");
+		if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "display") == 0)
+		{
+			ESP_LOGI(TAG, "Received display download command");
+		}
+		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "rgb") == 0)
+		{
+			ESP_LOGI(TAG, "Received RGB download command");
+		}
+		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "audio") == 0)
+		{
+			ESP_LOGI(TAG, "Received audio download command");
+		}
+		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "notification") == 0)
+		{
+			ESP_LOGI(TAG, "Received notification download command");
+			cJSON *message_item = cJSON_GetObjectItemCaseSensitive(json, "message");
+			if (cJSON_IsString(message_item) && strcmp(message_item->valuestring, "active_red") == 0)
+			{
+				ESP_LOGI(TAG, "Notification message: %s", message_item->valuestring);
+				notification_instructions.active = true;
+				notification_instructions.message = message_item->valuestring;
+			}
+			else
+			{
+				ESP_LOGW(TAG, "No valid 'message' field found for notification command");
+			}
+		}
+
+		// cJSON *url_item = cJSON_GetObjectItemCaseSensitive(json, "url");
+		// cJSON *file_item = cJSON_GetObjectItemCaseSensitive(json, "file");
+
+		// if (cJSON_IsString(url_item) && cJSON_IsString(file_item))
+		// {
+		// 	DownloadCommand_t cmd;
+		// 	memset(&cmd, 0, sizeof(DownloadCommand_t));
+
+		// 	// strncpy(cmd.url, url_item->valuestring, MAX_URL_LEN - 1);
+		// 	// strncpy(cmd.filename, file_item->valuestring, MAX_FILE_LEN - 1);
+
+		// 	strncpy(cmd.url, "http://80.225.207.106/esp32_images/updates.json", MAX_URL_LEN - 1);
+		// 	strncpy(cmd.filename, "/sdcard/updates.json", MAX_FILE_LEN - 1);
+
+		// 	// Push to queue without blocking (timeout = 0)
+		// 	if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
+		// 	{
+		// 		ESP_LOGE(TAG, "Download queue is full! Dropping command.");
+		// 	}
+		// 	else
+		// 	{
+		// 		ESP_LOGI(TAG, "Download command enqueued successfully.");
+		// 	}
+		// }
+		cJSON_Delete(json);
+		free(payload);
 	}
+	break;
 	case MQTT_EVENT_ERROR:
 		ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
 		ESP_LOGI(TAG, "MQTT5 return code is %d", event->error_handle->connect_return_code);
@@ -429,38 +492,6 @@ static void mqtt5_app_start(void)
 	mqtt5_cfg.session.last_will.qos = 1;
 	mqtt5_cfg.session.last_will.retain = true;
 	mqtt5_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
-
-#if CONFIG_BROKER_URL_FROM_STDIN
-	char line[128];
-
-	if (strcmp(mqtt5_cfg.uri, "FROM_STDIN") == 0)
-	{
-		int count = 0;
-		printf("Please enter url of mqtt broker\n");
-		while (count < 128)
-		{
-			int c = fgetc(stdin);
-			if (c == '\n')
-			{
-				line[count] = '\0';
-				break;
-			}
-			else if (c > 0 && c < 127)
-			{
-				line[count] = c;
-				++count;
-			}
-			vTaskDelay(10 / portTICK_PERIOD_MS);
-		}
-		mqtt5_cfg.broker.address.uri = line;
-		printf("Broker url: %s\n", line);
-	}
-	else
-	{
-		ESP_LOGE(TAG, "Configuration mismatch: wrong broker url");
-		abort();
-	}
-#endif /* CONFIG_BROKER_URL_FROM_STDIN */
 
 	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
 
@@ -586,6 +617,37 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
 };
 #endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
 
+void led_test_task(void *arg)
+{
+	gpio_config_t gpio_conf = {};
+	gpio_conf.intr_type = GPIO_INTR_DISABLE;
+	gpio_conf.mode = GPIO_MODE_OUTPUT;
+	gpio_conf.pin_bit_mask = 0x1ULL << 3;
+	gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+	gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+
+	ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
+	for (;;)
+	{
+		if (notification_instructions.active)
+		{
+			ESP_LOGI(TAG, "Activating red notification LED");
+			for (int i = 0; i < 10; i++)
+			{
+				gpio_set_level((gpio_num_t)3, 0);
+				vTaskDelay(pdMS_TO_TICKS(100));
+				gpio_set_level((gpio_num_t)3, 1);
+				vTaskDelay(pdMS_TO_TICKS(100));
+			}
+			notification_instructions.active = false; // Reset the flag after notification
+		}
+		else
+		{
+			vTaskDelay(pdMS_TO_TICKS(1000)); // Sleep for a while when not active
+		}
+	}
+}
+
 extern "C" void app_main(void)
 {
 	user_app_init();
@@ -666,6 +728,8 @@ extern "C" void app_main(void)
 
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8 * 1024, NULL, 4, NULL, 1);
+	xTaskCreate(led_test_task, "led_test", 4096, NULL, 5, &notification_task_handle);
+
 	if (example_lvgl_lock(-1))
 	{
 		user_ui_init();

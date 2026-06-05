@@ -5,10 +5,12 @@ menu "Example Configuration"
         default "mqtt://mqtt.eclipseprojects.io"
         help
             URL of the broker to connect to
-
-    config BROKER_URL_FROM_STDIN
-        bool
-        default y if BROKER_URL = "FROM_STDIN"
+    
+    config COMMAND_TOPIC
+        string "Command topic"
+        default "company/command"
+        help
+            MQTT topic to which the device subscribes to receive commands.
     
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
