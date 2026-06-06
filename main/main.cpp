@@ -63,6 +63,8 @@ TaskHandle_t notification_task_handle = NULL;
 // Global Handle for the Queue
 static QueueHandle_t download_cmd_queue = NULL;
 
+extern lv_obj_t *dynamic_epd_image;
+
 static const char *TAG = "app";
 
 // Wifi provisioning definitions
@@ -151,11 +153,11 @@ static bool example_lvgl_lock(int timeout_ms);
 static void example_lvgl_unlock(void);
 static void example_lvgl_port_task(void *arg);
 static void wifi_prov_task(void *arg);
-
+#if 0
 static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
 {
 	uint16_t *buffer = (uint16_t *)color_p;
-	driver->EPD_Clear();
+	// driver->EPD_Clear();
 	for (int y = area->y1; y <= area->y2; y++)
 	{
 		for (int x = area->x1; x <= area->x2; x++)
@@ -166,6 +168,62 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 		}
 	}
 	driver->EPD_DisplayPart();
+	lv_disp_flush_ready(disp);
+}
+#endif
+
+static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
+{
+	uint16_t *buffer = (uint16_t *)color_p;
+
+	// Telemetry log to verify the background task is executing this callback
+	ESP_LOGI("FLUSH", "Rendering frame area: x1=%d, y1=%d to x2=%d, y2=%d",
+			 area->x1, area->y1, area->x2, area->y2);
+
+	// REMOVED: driver->EPD_Clear(); // Do not wipe the screen inside the rendering engine!
+
+	int black_pixels = 0;
+	int white_pixels = 0;
+
+	for (int y = area->y1; y <= area->y2; y++)
+	{
+		for (int x = area->x1; x <= area->x2; x++)
+		{
+			uint16_t rgb565 = *buffer;
+
+			// Extract color channels and scale them up to standard 8-bit values (0-255)
+			uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;
+			uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;
+			uint8_t b = (rgb565 & 0x1F) << 3;
+
+			// Calculate true human relative luminance (Grayscale brightness)
+			uint8_t brightness = (r * 77 + g * 150 + b * 29) >> 8;
+
+			// Map to black or white based on the midpoint threshold (128)
+			uint8_t color;
+			if (brightness < 128)
+			{
+				color = DRIVER_COLOR_BLACK;
+				black_pixels++;
+			}
+			else
+			{
+				color = DRIVER_COLOR_WHITE;
+				white_pixels++;
+			}
+
+			driver->EPD_DrawColorPixel(x, y, color);
+			buffer++;
+		}
+	}
+
+	// Log the pixel distribution so you know if the image is rendering dark or light elements
+	ESP_LOGI("FLUSH", "Canvas Stats -> Packed Black: %d, Packed White: %d", black_pixels, white_pixels);
+
+	// Push the final packed frame to the physical e-paper panel
+	driver->EPD_DisplayPart();
+
+	// Notify LVGL that the flush cycle is complete
 	lv_disp_flush_ready(disp);
 }
 
@@ -413,6 +471,8 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "display") == 0)
 		{
 			ESP_LOGI(TAG, "Received display download command");
+			display_instructions.active = true;
+			display_instructions.data_path = "/sdcard/landing.png"; // Example path, adjust as needed
 		}
 		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "rgb") == 0)
 		{
@@ -648,6 +708,44 @@ void led_test_task(void *arg)
 	}
 }
 
+void display_update_task(void *arg)
+{
+	for (;;)
+	{
+		// 1. Check if the downloader has signaled a new image is ready
+		if (display_instructions.active)
+		{
+			ESP_LOGI(TAG, "New image ready for display: %s", display_instructions.data_path.c_str());
+
+			// 2. Lock the UI thread before touching LVGL
+			if (example_lvgl_lock(-1))
+			{
+				if (dynamic_epd_image != NULL)
+				{
+					// 3. Format the path for LVGL (Prepend the LVGL Drive Letter 'A:')
+					// Example: "/sdcard/new_image.png" becomes "A:/sdcard/new_image.png"
+					std::string lvgl_path = "A:" + display_instructions.data_path;
+
+					// 4. Set the new image source
+					lv_image_set_src(dynamic_epd_image, lvgl_path.c_str());
+
+					// 5. Unhide the widget if it was hidden at startup
+					lv_obj_clear_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
+				}
+
+				// 6. Release the UI lock
+				example_lvgl_unlock();
+			}
+
+			// 7. Reset the instruction flag so we don't reload it endlessly
+			display_instructions.active = false;
+		}
+
+		// Sleep for 500ms before checking again (prevents CPU hogging)
+		vTaskDelay(pdMS_TO_TICKS(500));
+	}
+}
+
 extern "C" void app_main(void)
 {
 	user_app_init();
@@ -666,6 +764,22 @@ extern "C" void app_main(void)
 	if (sdcard->mount())
 	{
 		ESP_LOGI(TAG, "SD card mounted successfully. You can now perform file operations.");
+		// Use Posix style file reading as an example
+		FILE *file = fopen("/sdcard/hello.txt", "r");
+		if (file)
+		{
+			char buffer[128];
+			while (fgets(buffer, sizeof(buffer), file))
+			{
+				fileContent += buffer;
+			}
+			fclose(file);
+			ESP_LOGI(TAG, "Content of hello.txt:\n%s", fileContent.c_str());
+		}
+		else
+		{
+			ESP_LOGE(TAG, "Failed to open file on SD card.");
+		}
 	}
 	else
 	{
@@ -727,8 +841,9 @@ extern "C" void app_main(void)
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
-	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8 * 1024, NULL, 4, NULL, 1);
+	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 20 * 1024, NULL, 4, NULL, 1);
 	xTaskCreate(led_test_task, "led_test", 4096, NULL, 5, &notification_task_handle);
+	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
 
 	if (example_lvgl_lock(-1))
 	{

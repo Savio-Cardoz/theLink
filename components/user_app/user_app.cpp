@@ -15,6 +15,8 @@ epaper_driver_display *driver = NULL;
 board_power_bsp_t board_div(EPD_PWR_PIN, Audio_PWR_PIN, VBAT_PWR_PIN);
 
 lv_ui src_ui;
+lv_obj_t *dynamic_epd_image = NULL;
+extern lv_display_t *disp;
 
 void user_app_init(void)
 {
@@ -43,17 +45,89 @@ void loop_lvgl_img(void *arg)
     lv_ui *ui = (lv_ui *)arg;
     for (;;)
     {
-        lv_obj_clear_flag(ui->screen_img_1, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ui->screen_img_2, LV_OBJ_FLAG_HIDDEN);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        lv_obj_clear_flag(ui->screen_img_2, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ui->screen_img_1, LV_OBJ_FLAG_HIDDEN);
+        // lv_obj_clear_flag(ui->screen_img_1, LV_OBJ_FLAG_HIDDEN);
+        // lv_obj_add_flag(ui->screen_img_2, LV_OBJ_FLAG_HIDDEN);
+        // vTaskDelay(pdMS_TO_TICKS(5000));
+        // lv_obj_clear_flag(ui->screen_img_2, LV_OBJ_FLAG_HIDDEN);
+        // lv_obj_add_flag(ui->screen_img_1, LV_OBJ_FLAG_HIDDEN);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
 void user_ui_init(void)
 {
-    setup_ui(&src_ui);
-    xTaskCreatePinnedToCore(loop_lvgl_img, "loop_lvgl_img", 4 * 1024, &src_ui, 4, NULL, 1);
+    // setup_ui(&src_ui);
+
+    // // 1. Create the blank image widget at startup
+    // dynamic_epd_image = lv_image_create(lv_screen_active());
+    // lv_obj_center(dynamic_epd_image);
+
+    // // 2. Hide it initially so it doesn't display a broken icon before the download
+    // lv_obj_add_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
+
+    // xTaskCreatePinnedToCore(loop_lvgl_img, "loop_lvgl_img", 4 * 1024, &src_ui, 4, NULL, 1);
+
+    const char *TEST_TAG = "IMG_TEST";
+    ESP_LOGI(TEST_TAG, "========================================");
+    ESP_LOGI(TEST_TAG, "Running Direct LVGL Decoder Diagnostics");
+    ESP_LOGI(TEST_TAG, "========================================");
+
+    // 1. Double check the OS file visibility
+    const char *physical_path = "/sdcard/landing.png";
+    FILE *file_check = fopen(physical_path, "r");
+    if (file_check == NULL)
+    {
+        ESP_LOGE(TEST_TAG, "OS ERROR: Cannot open '%s' directly.", physical_path);
+        return;
+    }
+    fclose(file_check);
+
+    // 2. Clear old objects to isolate the test scene
+    lv_obj_clean(lv_screen_active());
+
+    // ---------------------------------------------------------
+    // DIAGNOSTIC 1: Force LVGL's Decoder Subsystem to Reveal Itself
+    // ---------------------------------------------------------
+    lv_image_header_t img_header;
+    const char *lvgl_path = "A:/landing.png";
+
+    // Explicitly ask LVGL if it can parse the file header via POSIX + LodePNG
+    lv_result_t decoder_res = lv_image_decoder_get_info(lvgl_path, &img_header);
+
+    if (decoder_res != LV_RESULT_OK)
+    {
+        ESP_LOGE(TEST_TAG, "LVGL DECODER ERROR: Failed to parse '%s'!", lvgl_path);
+        ESP_LOGE(TEST_TAG, "This means either 'LV_USE_FS_POSIX' is missing your mount path mapping,");
+        ESP_LOGE(TEST_TAG, "or 'LV_USE_LODEPNG' is disabled in your build configurations.");
+    }
+    else
+    {
+        ESP_LOGI(TEST_TAG, "LVGL DECODER SUCCESS: Found valid image metadata!");
+        ESP_LOGI(TEST_TAG, "Width: %d, Height: %d, Color Format: %d",
+                 img_header.w, img_header.h, img_header.cf);
+
+        // Header looks good, proceed with building the image widget
+        lv_obj_t *test_image = lv_image_create(lv_screen_active());
+        lv_image_set_src(test_image, lvgl_path);
+        lv_obj_center(test_image);
+    }
+
+    // ---------------------------------------------------------
+    // DIAGNOSTIC 2: The Control Variable (Hardware vs. Decoder test)
+    // ---------------------------------------------------------
+    // We will draw a native, solid black bar at the top of the display.
+    // If you see this black bar but NO image, your e-paper driver is working perfectly,
+    // and the bug lies purely in the image file path or image size.
+    lv_obj_t *test_bar = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(test_bar, 200, 40); // 40-pixel tall strip across the top
+    lv_obj_align(test_bar, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Force background to pure black
+    lv_obj_set_style_bg_color(test_bar, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_border_width(test_bar, 0, LV_PART_MAIN);
+
+    // Schedule drawing flag
+    lv_obj_invalidate(lv_screen_active());
+    ESP_LOGI(TEST_TAG, "Display invalidated. Awaiting background task render cycle...");
+    ESP_LOGI(TEST_TAG, "========================================");
 }
