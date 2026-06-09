@@ -176,11 +176,8 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 {
 	uint16_t *buffer = (uint16_t *)color_p;
 
-	// Telemetry log to verify the background task is executing this callback
-	ESP_LOGI("FLUSH", "Rendering frame area: x1=%d, y1=%d to x2=%d, y2=%d",
+	ESP_LOGI("FLUSH", "Rendering frame area: x1=%" PRId32 ", y1=%" PRId32 " to x2=%" PRId32 ", y2=%" PRId32,
 			 area->x1, area->y1, area->x2, area->y2);
-
-	// REMOVED: driver->EPD_Clear(); // Do not wipe the screen inside the rendering engine!
 
 	int black_pixels = 0;
 	int white_pixels = 0;
@@ -191,24 +188,19 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 		{
 			uint16_t rgb565 = *buffer;
 
-			// Extract color channels and scale them up to standard 8-bit values (0-255)
 			uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;
 			uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;
 			uint8_t b = (rgb565 & 0x1F) << 3;
 
-			// Calculate true human relative luminance (Grayscale brightness)
 			uint8_t brightness = (r * 77 + g * 150 + b * 29) >> 8;
 
-			// Map to black or white based on the midpoint threshold (128)
-			uint8_t color;
-			if (brightness < 128)
+			uint8_t color = (brightness < 128) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
+			if (color == DRIVER_COLOR_BLACK)
 			{
-				color = DRIVER_COLOR_BLACK;
 				black_pixels++;
 			}
 			else
 			{
-				color = DRIVER_COLOR_WHITE;
 				white_pixels++;
 			}
 
@@ -217,13 +209,14 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 		}
 	}
 
-	// Log the pixel distribution so you know if the image is rendering dark or light elements
 	ESP_LOGI("FLUSH", "Canvas Stats -> Packed Black: %d, Packed White: %d", black_pixels, white_pixels);
 
-	// Push the final packed frame to the physical e-paper panel
-	driver->EPD_DisplayPart();
+	// ====================================================================
+	// FIX: Change EPD_DisplayPart() to EPD_Display() for Full Refresh
+	// ====================================================================
+	driver->EPD_Display();
+	// ====================================================================
 
-	// Notify LVGL that the flush cycle is complete
 	lv_disp_flush_ready(disp);
 }
 
@@ -263,7 +256,24 @@ static void download_orchestrator_task(void *arg)
 			std::string fileStr(incoming_cmd.filename);
 
 			// Trigger the download
-			bool success = downloader.startDownload(urlStr, fileStr);
+			bool success = downloader.startDownload(urlStr, fileStr, [](bool success, const std::string &filepath)
+													{
+				if (success)
+				{
+					ESP_LOGI(TAG, "Download completed successfully: %s", filepath.c_str());
+					display_instructions.data_path = filepath; // Update the display instructions with the new file path
+					display_instructions.active = true; // Signal the display task to show the new image
+					// Note: In a real application, you might want to use a more robust method
+					// to signal the display task, such as a FreeRTOS event group or direct task notification.
+					if(display_task_handle != NULL)
+					{
+						xTaskNotifyGive(display_task_handle); // Notify the display task that new data is available
+					}
+				}
+				else
+				{
+					ESP_LOGE(TAG, "Download failed for file: %s", filepath.c_str());
+				} });
 
 			if (!success)
 			{
@@ -458,70 +468,66 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 			return;
 		}
 
-		// cJSON *command_item = cJSON_GetObjectItemCaseSensitive(json, "command");
-		// if (!cJSON_IsString(command_item) || (command_item->valuestring == NULL))
-		// {
-		// 	ESP_LOGE(TAG, "Invalid or missing 'command' field in JSON");
-		// 	cJSON_Delete(json);
-		// 	free(payload);
-		// 	return;
-		// }
+		cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
+		if (!cJSON_IsObject(data))
+		{
+			ESP_LOGE(TAG, "Invalid or missing 'data' object in JSON");
+			cJSON_Delete(json);
+			free(payload);
+			return;
+		}
 
-		cJSON *module_item = cJSON_GetObjectItemCaseSensitive(json, "module");
-		if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "display") == 0)
+		/* get the download path and filename from the nested data object */
+		cJSON *path_item = cJSON_GetObjectItemCaseSensitive(data, "download");
+		cJSON *filename_item = cJSON_GetObjectItemCaseSensitive(data, "filename");
+		if (!cJSON_IsString(path_item) || (path_item->valuestring == NULL) ||
+			!cJSON_IsString(filename_item) || (filename_item->valuestring == NULL))
 		{
-			ESP_LOGI(TAG, "Received display download command");
-			display_instructions.active = true;
-			display_instructions.data_path = "/sdcard/landing.png"; // Example path, adjust as needed
+			ESP_LOGE(TAG, "Invalid or missing 'download' or 'filename' field in JSON");
+			cJSON_Delete(json);
+			free(payload);
+			return;
 		}
-		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "rgb") == 0)
+
+		if (path_item->valuestring[0] == 'h')
 		{
-			ESP_LOGI(TAG, "Received RGB download command");
-		}
-		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "audio") == 0)
-		{
-			ESP_LOGI(TAG, "Received audio download command");
-		}
-		else if (cJSON_IsString(module_item) && strcmp(module_item->valuestring, "notification") == 0)
-		{
-			ESP_LOGI(TAG, "Received notification download command");
-			cJSON *message_item = cJSON_GetObjectItemCaseSensitive(json, "message");
-			if (cJSON_IsString(message_item) && strcmp(message_item->valuestring, "active_red") == 0)
+			ESP_LOGI(TAG, "Download path: %s", path_item->valuestring);
+			DownloadCommand_t cmd;
+			memset(&cmd, 0, sizeof(DownloadCommand_t));
+			strncpy(cmd.url, path_item->valuestring, MAX_URL_LEN - 1);
+			strncpy(cmd.filename, filename_item->valuestring, MAX_FILE_LEN - 1); // Example filename, adjust as needed
+
+			if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
 			{
-				ESP_LOGI(TAG, "Notification message: %s", message_item->valuestring);
-				notification_instructions.active = true;
-				notification_instructions.message = message_item->valuestring;
+				ESP_LOGE(TAG, "Download queue is full! Dropping command.");
 			}
 			else
 			{
-				ESP_LOGW(TAG, "No valid 'message' field found for notification command");
+				ESP_LOGI(TAG, "Download command enqueued successfully.");
 			}
 		}
 
-		// cJSON *url_item = cJSON_GetObjectItemCaseSensitive(json, "url");
-		// cJSON *file_item = cJSON_GetObjectItemCaseSensitive(json, "file");
+		cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
+		if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0)
+		{
+			ESP_LOGI(TAG, "Received display download command");
+			display_instructions.active = true;
+			display_instructions.data_path = "/sdcard/" + std::string(filename_item->valuestring);
+		}
+		else if (cJSON_IsString(type) && strcmp(type->valuestring, "rgb") == 0)
+		{
+			ESP_LOGI(TAG, "Received RGB download command");
+		}
+		else if (cJSON_IsString(type) && strcmp(type->valuestring, "audio") == 0)
+		{
+			ESP_LOGI(TAG, "Received audio download command");
+		}
+		else if (cJSON_IsString(type) && strcmp(type->valuestring, "notification") == 0)
+		{
+			ESP_LOGI(TAG, "Received notification download command");
+			notification_instructions.active = true;
+		}
 
-		// if (cJSON_IsString(url_item) && cJSON_IsString(file_item))
-		// {
-		// 	DownloadCommand_t cmd;
-		// 	memset(&cmd, 0, sizeof(DownloadCommand_t));
-
-		// 	// strncpy(cmd.url, url_item->valuestring, MAX_URL_LEN - 1);
-		// 	// strncpy(cmd.filename, file_item->valuestring, MAX_FILE_LEN - 1);
-
-		// 	strncpy(cmd.url, "http://80.225.207.106/esp32_images/updates.json", MAX_URL_LEN - 1);
-		// 	strncpy(cmd.filename, "/sdcard/updates.json", MAX_FILE_LEN - 1);
-
-		// 	// Push to queue without blocking (timeout = 0)
-		// 	if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
-		// 	{
-		// 		ESP_LOGE(TAG, "Download queue is full! Dropping command.");
-		// 	}
-		// 	else
-		// 	{
-		// 		ESP_LOGI(TAG, "Download command enqueued successfully.");
-		// 	}
-		// }
 		cJSON_Delete(json);
 		free(payload);
 	}
@@ -555,6 +561,7 @@ static void mqtt5_app_start(void)
 
 	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
 
+	/* TODO: Remove commented lines of code*/
 	/* Set connection properties and user properties */
 	// esp_mqtt5_client_set_user_property(&connect_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
 	// esp_mqtt5_client_set_user_property(&connect_property.will_user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
@@ -712,7 +719,9 @@ void display_update_task(void *arg)
 {
 	for (;;)
 	{
-		// 1. Check if the downloader has signaled a new image is ready
+		/* Wait for notification from a task */
+		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+
 		if (display_instructions.active)
 		{
 			ESP_LOGI(TAG, "New image ready for display: %s", display_instructions.data_path.c_str());
@@ -786,6 +795,7 @@ extern "C" void app_main(void)
 		ESP_LOGE(TAG, "Failed to mount SD card. Check the connections and try again.");
 	}
 
+	/* Epaper display initialization */
 	lv_init();
 	lv_display_t *disp = lv_display_create(EPD_WIDTH, EPD_HEIGHT); /* 以水平和垂直分辨率（像素）进行基本初始化 */
 	lv_display_set_flush_cb(disp, example_lvgl_flush_cb);
@@ -1133,6 +1143,7 @@ static void wifi_prov_task(void *arg)
 
 	while (1)
 	{
+		// TODO: Dummy loop, needs to be changed later to do some actual work or can be removed if not needed
 		ESP_LOGI(TAG, "Hello World!");
 		vTaskDelay(1000 / portTICK_PERIOD_MS);
 	}

@@ -4,3 +4,10 @@
 
 Enable CONFIG_MQTT_PROTOCOL_5
 
+{
+    "type":"LED",   
+    "data": {
+        "download":"domain.com",
+        "filename":"file.bin"
+    }
+}

@@ -14,6 +14,7 @@ constexpr uint32_t WDT_TIMEOUT_MS = 5000;   // Timeout for blocking operations
 void AsyncDownloader::runStorageTask()
 {
     uint8_t rxBuffer[CHUNK_SIZE];
+    bool downloadSuccess = true;
 
     // Open file using standard C library (relies on FATFS/VFS being mounted)
     FILE *file = fopen(currentFilename.c_str(), "wb");
@@ -21,6 +22,10 @@ void AsyncDownloader::runStorageTask()
     {
         ESP_LOGE(TAG, "Failed to open %s for writing!", currentFilename.c_str());
         isDownloadActive = false;
+        if (onCompleteCallback)
+        {
+            onCompleteCallback(false, currentFilename);
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -43,6 +48,7 @@ void AsyncDownloader::runStorageTask()
             {
                 ESP_LOGE(TAG, "Storage Task: Write failed! SD Card full or removed?");
                 isDownloadActive = false; // Abort download
+                downloadSuccess = false;
                 break;
             }
         }
@@ -50,6 +56,11 @@ void AsyncDownloader::runStorageTask()
 
     fclose(file);
     ESP_LOGI(TAG, "Storage Task: File closed. Shutting down.");
+
+    if (onCompleteCallback)
+    {
+        onCompleteCallback(downloadSuccess, currentFilename);
+    }
 
     storageTaskHandle = nullptr;
     vTaskDelete(NULL);
@@ -168,7 +179,7 @@ AsyncDownloader::~AsyncDownloader()
 }
 
 // --- 3. The Orchestrator ---
-bool AsyncDownloader::startDownload(const std::string &url, const std::string &filename)
+bool AsyncDownloader::startDownload(const std::string &url, const std::string &filename, DownloadCallback_t callback)
 {
     if (isDownloadActive)
     {
@@ -178,6 +189,7 @@ bool AsyncDownloader::startDownload(const std::string &url, const std::string &f
 
     currentUrl = url;
     currentFilename = filename;
+    onCompleteCallback = callback;
     isDownloadActive = true;
 
     xStreamBufferReset(streamBuffer);

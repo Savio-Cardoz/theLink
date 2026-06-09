@@ -6,10 +6,21 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include <atomic>
+#include <functional>
 
 class AsyncDownloader
 {
+public:
+    // Define a callback type: void callback(bool success, std::string filename)
+    using DownloadCallback_t = std::function<void(bool, const std::string &)>;
+
+    AsyncDownloader();
+    ~AsyncDownloader();
+
+    bool startDownload(const std::string &url, const std::string &filename, DownloadCallback_t callback = nullptr);
+
 private:
+    DownloadCallback_t onCompleteCallback{nullptr};
     StreamBufferHandle_t streamBuffer = nullptr;
     TaskHandle_t storageTaskHandle = nullptr;
     TaskHandle_t httpTaskHandle = nullptr;
@@ -34,12 +45,6 @@ private:
         AsyncDownloader *instance = static_cast<AsyncDownloader *>(param);
         instance->runHttpTask();
     }
-
-public:
-    AsyncDownloader();
-    ~AsyncDownloader();
-
-    bool startDownload(const std::string &url, const std::string &filename);
 };
 
 #endif // __data_downloader_hpp__
