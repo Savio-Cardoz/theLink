@@ -195,7 +195,7 @@ bool AsyncDownloader::startDownload(const std::string &url, const std::string &f
     xStreamBufferReset(streamBuffer);
 
     // Spawn Storage Task
-    xTaskCreate(storageTaskWrapper, "StorageTask", 4096, this, 5, &storageTaskHandle);
+    xTaskCreate(storageTaskWrapper, "StorageTask", 8192, this, 5, &storageTaskHandle);
 
     // Spawn HTTP Task
     xTaskCreate(httpTaskWrapper, "HttpTask", 8192, this, 4, &httpTaskHandle);

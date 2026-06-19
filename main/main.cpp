@@ -31,8 +31,69 @@
 #include "sdcard_manager.hpp"
 #include "user_config.h"
 
+#include "driver/gpio.h"  // Ensure this header is included
+
+#define RESET_BUTTON_GPIO   GPIO_NUM_18  // Standard BOOT button on ESP32 Dev Kits
+#define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
+
+// 2. Global Widget Pointers
+lv_obj_t *wifi_status_icon = NULL; // Overlay widget container
+lv_obj_t *prov_qr_code_widget = NULL; // Handle for provisioning QR code screen
+
+/**
+ * @brief Checks if the reset button is being held down at boot.
+ * @return true if pressed, false otherwise.
+ */
+static bool check_reset_button_at_boot(void)
+{
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << RESET_BUTTON_GPIO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    // Allow the lines to settle and give the user a tiny 200ms window 
+    // to make sure they are intentionally holding the button down
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (gpio_get_level(RESET_BUTTON_GPIO) == BUTTON_PRESSED_LEVEL)
+    {
+        ESP_LOGW("RESET", "Reset button detected down at power-up! Holding for confirmation...");
+        // Optional: Wait an extra second to avoid accidental triggers
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        return (gpio_get_level(RESET_BUTTON_GPIO) == BUTTON_PRESSED_LEVEL);
+    }
+    
+    return false;
+}
+
+// ==========================================================
+// 2. Data Definitions & Structures
+// ==========================================================
 #define MAX_URL_LEN 256
 #define MAX_FILE_LEN 64
+
+// 1. External Asset References
+extern const lv_image_dsc_t wifi;    // Valid connection image asset
+extern const lv_image_dsc_t wifi_no; // Missing connection image asset
+extern lv_obj_t *dynamic_epd_image;
+
+// 3. UI Status Event Definitions
+typedef enum {
+    UI_WIFI_DISCONNECTED,
+    UI_WIFI_CONNECTED
+} ui_event_type_t;
+
+ui_event_type_t wifi_status = ui_event_type_t::UI_WIFI_DISCONNECTED;
+// Persistent structures for the live binary QR matrix layout engine
+static lv_image_dsc_t qr_dynamic_bmp;
+static uint8_t *qr_pixel_buffer = NULL;
+static lv_obj_t *qr_image_obj = NULL;
+
+// Queue to safely pass state transitions to the LVGL thread
+static QueueHandle_t ui_event_queue = NULL;
 
 // The structure passed through the FreeRTOS Queue
 typedef struct
@@ -107,12 +168,86 @@ static const char sec2_verifier[] = {
 
 #endif
 
-static void log_error_if_nonzero(const char *message, int error_code)
+void save_settings_to_json(void)
 {
-	if (error_code != 0)
-	{
-		ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-	}
+    // Create the root JSON object structure
+    cJSON *root = cJSON_CreateObject();
+    
+    // Add display path string
+    cJSON_AddStringToObject(root, "display", display_instructions.data_path.c_str());
+    
+    // Add LED pattern state status string
+    cJSON_AddStringToObject(root, "led", notification_instructions.active ? "active" : "inactive");
+
+    char *json_str = cJSON_Print(root);
+    if (json_str != NULL)
+    {
+        FILE *f = fopen("/sdcard/config.json", "w");
+        if (f != NULL)
+        {
+            fputs(json_str, f);
+            fclose(f);
+            ESP_LOGI("CONFIG", "Configuration saved successfully to SD Card.");
+        }
+        else
+        {
+            ESP_LOGE("CONFIG", "Failed to open config.json for writing!");
+        }
+        free(json_str); // Always free memory allocated by cJSON_Print
+    }
+    cJSON_Delete(root);
+}
+
+void load_settings_from_json(void)
+{
+    FILE *f = fopen("/sdcard/config.json", "r");
+    if (f == NULL)
+    {
+        ESP_LOGW("CONFIG", "No config.json found on SD Card. Using defaults.");
+        return;
+    }
+
+    // Determine file size to allocate buffer space cleanly
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *json_buf = (char *)malloc(file_size + 1);
+    if (json_buf != NULL)
+    {
+        fread(json_buf, 1, file_size, f);
+        json_buf[file_size] = '\0';
+        fclose(f);
+
+        cJSON *json = cJSON_Parse(json_buf);
+        if (json != NULL)
+        {
+            // Parse and apply Display Path parameters
+            cJSON *display_item = cJSON_GetObjectItemCaseSensitive(json, "display");
+            if (cJSON_IsString(display_item) && (display_item->valuestring != NULL))
+            {
+                display_instructions.data_path = std::string(display_item->valuestring);
+                display_instructions.active = true; // Flag for boot processing
+                ESP_LOGI("CONFIG", "Restored display state path: %s", display_instructions.data_path.c_str());
+            }
+
+            // Parse and apply LED notification parameters
+            cJSON *led_item = cJSON_GetObjectItemCaseSensitive(json, "led");
+            if (cJSON_IsString(led_item) && (led_item->valuestring != NULL))
+            {
+                notification_instructions.active = (strcmp(led_item->valuestring, "active") == 0);
+                ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
+            }
+
+            cJSON_Delete(json);
+        }
+        free(json_buf);
+    }
+    else
+    {
+        fclose(f);
+        ESP_LOGE("CONFIG", "Heap allocation failed for reading config JSON text buffer.");
+    }
 }
 
 static esp_err_t example_get_sec2_salt(const char **salt, uint16_t *salt_len)
@@ -172,16 +307,64 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 }
 #endif
 
+void ui_overlay_update_task(void *arg)
+{
+    ui_event_type_t incoming_event;
+
+    for (;;)
+    {
+        // Sleep indefinitely until a network event signals this queue
+        if (xQueueReceive(ui_event_queue, &incoming_event, portMAX_DELAY) == pdTRUE)
+        {
+            // Always lock LVGL before mutating any live widgets
+            if (example_lvgl_lock(-1))
+            {
+                if (wifi_status_icon != NULL)
+                {
+                    if (incoming_event == UI_WIFI_CONNECTED)
+                    {
+                        ESP_LOGI("UI_TASK", "Swapping icon source: WiFi Connected");
+                        lv_image_set_src(wifi_status_icon, &wifi); // Apply active icon
+                    }
+                    else if (incoming_event == UI_WIFI_DISCONNECTED)
+                    {
+                        ESP_LOGI("UI_TASK", "Swapping icon source: WiFi Disconnected");
+                        lv_image_set_src(wifi_status_icon, &wifi_no); // Apply warning icon
+                    }
+
+                    // Force the widget to render the fresh source map
+                    lv_obj_invalidate(wifi_status_icon);
+                }
+                example_lvgl_unlock(); // Always release the lock!
+            }
+        }
+    }
+}
+
 static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
 {
 	uint16_t *buffer = (uint16_t *)color_p;
 
-	ESP_LOGI("FLUSH", "Rendering frame area: x1=%" PRId32 ", y1=%" PRId32 " to x2=%" PRId32 ", y2=%" PRId32,
-			 area->x1, area->y1, area->x2, area->y2);
+	// 1. Detect if LVGL is commanding a full-screen draw (0,0 to 199,199)
+	// or just a small, localized widget modification zone (like the Wi-Fi icon)
+	bool is_full_refresh = (area->x1 == 0 && area->y1 == 0 && area->x2 == 199 && area->y2 == 199);
+
+	if (is_full_refresh)
+	{
+		// Prime the controller for a FULL global blink cycle (prevents panel ghosting)
+		driver->EPD_Init();
+	}
+	else
+	{
+		// Prime the controller for a silent, ultra-fast PARTIAL update loop
+		driver->EPD_Init_Partial();
+	}
 
 	int black_pixels = 0;
 	int white_pixels = 0;
 
+	// This nested loop naturally handles partial frames because it only iterates 
+	// through the specific bounding box coordinates passed by the LVGL engine!
 	for (int y = area->y1; y <= area->y2; y++)
 	{
 		for (int x = area->x1; x <= area->x2; x++)
@@ -209,15 +392,19 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
 		}
 	}
 
-	ESP_LOGI("FLUSH", "Canvas Stats -> Packed Black: %d, Packed White: %d", black_pixels, white_pixels);
+	// 2. Commit the drawing data to the panel glass based on refresh type
+	if (is_full_refresh)
+	{
+		ESP_LOGI("FLUSH", "Executing Global Full Refresh -> Black: %d, White: %d", black_pixels, white_pixels);
+		driver->EPD_Display(); // Global flash refresh pass
+	}
+	else
+	{
+		ESP_LOGI("FLUSH", "Executing Silent Partial Refresh -> Black: %d, White: %d", black_pixels, white_pixels);
+		driver->EPD_DisplayPart(); // Quick localized ink migration
+	}
 
-	// ====================================================================
-	// FIX: Change EPD_DisplayPart() to EPD_Display() for Full Refresh
-	// ====================================================================
-	driver->EPD_Display();
-	// ====================================================================
-
-	lv_disp_flush_ready(disp);
+	lv_disp_flush_ready(disp); //
 }
 
 static void example_increase_lvgl_tick(void *arg)
@@ -263,6 +450,8 @@ static void download_orchestrator_task(void *arg)
 					ESP_LOGI(TAG, "Download completed successfully: %s", filepath.c_str());
 					display_instructions.data_path = filepath; // Update the display instructions with the new file path
 					display_instructions.active = true; // Signal the display task to show the new image
+
+					save_settings_to_json();
 					// Note: In a real application, you might want to use a more robust method
 					// to signal the display task, such as a FreeRTOS event group or direct task notification.
 					if(display_task_handle != NULL)
@@ -334,6 +523,23 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 			{
 				ESP_LOGE(TAG, "Failed to de-initialize provisioning manager: %s", esp_err_to_name(err));
 			}
+
+			// Clean up the binary image widget & its PSRAM allocation buffer
+            if (example_lvgl_lock(-1))
+            {
+                if (qr_image_obj != NULL)
+                {
+                    lv_obj_delete(qr_image_obj);
+                    qr_image_obj = NULL;
+                }
+                if (qr_pixel_buffer != NULL)
+                {
+                    heap_caps_free(qr_pixel_buffer);
+                    qr_pixel_buffer = NULL;
+                }
+                lv_obj_invalidate(lv_screen_active());
+                example_lvgl_unlock();
+            }
 			break;
 		}
 		default:
@@ -348,8 +554,18 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 			esp_wifi_connect();
 			break;
 		case WIFI_EVENT_STA_DISCONNECTED:
-			ESP_LOGI(TAG, "Disconnected. Connecting to the AP again...");
-			esp_wifi_connect();
+			{
+				ESP_LOGI(TAG, "Disconnected. Connecting to the AP again...");
+				if (UI_WIFI_CONNECTED == wifi_status)
+				{
+					wifi_status = ui_event_type_t::UI_WIFI_DISCONNECTED;
+					if (ui_event_queue) {
+					xQueueSend(ui_event_queue, &wifi_status, 0);
+					}
+				}
+
+				esp_wifi_connect();
+			}
 			break;
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
 		case WIFI_EVENT_AP_STACONNECTED:
@@ -367,6 +583,15 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 	{
 		ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
 		ESP_LOGI(TAG, "Connected with IP Address:" IPSTR, IP2STR(&event->ip_info.ip));
+
+		if (UI_WIFI_CONNECTED != wifi_status)
+		{
+			wifi_status = ui_event_type_t::UI_WIFI_CONNECTED;
+			if (ui_event_queue) {
+				xQueueSend(ui_event_queue, &wifi_status, 0);
+			}
+		}
+
 		/* Signal main application to continue execution */
 		xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
@@ -619,6 +844,77 @@ esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ss
 	return ESP_OK;
 }
 
+// ==========================================================
+// 7. Core Binary UI QR Generation Logic (No Canvas Needed)
+// ==========================================================
+static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
+    int qr_size = esp_qrcode_get_size(qrcode);
+    const int display_dim = 200; 
+
+    int scale = display_dim / qr_size;
+    if (scale < 1) scale = 1;
+
+    int offset_x = (display_dim - (qr_size * scale)) / 2;
+    int offset_y = (display_dim - (qr_size * scale)) / 2;
+
+    const size_t RGB565_SIZE = display_dim * display_dim * 2; 
+
+    if (qr_pixel_buffer == NULL) {
+        qr_pixel_buffer = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
+    }
+
+    if (qr_pixel_buffer == NULL) {
+        ESP_LOGE("QR_UI", "External frame allocation breakdown for QR matrix layer!");
+        return;
+    }
+
+    uint16_t *rgb565_dest = (uint16_t *)qr_pixel_buffer;
+    for (int i = 0; i < (display_dim * display_dim); i++) {
+        rgb565_dest[i] = 0xFFFF; // Clear canvas background to complete white
+    }
+
+    for (int y = 0; y < qr_size; y++) {
+        for (int x = 0; x < qr_size; x++) {
+            if (esp_qrcode_get_module(qrcode, x, y)) {
+                for (int py = 0; py < scale; py++) {
+                    for (int px = 0; px < scale; px++) {
+                        int target_x = offset_x + (x * scale) + px;
+                        int target_y = offset_y + (y * scale) + py;
+                        if (target_x >= 0 && target_x < display_dim && target_y >= 0 && target_y < display_dim) {
+                            rgb565_dest[target_y * display_dim + target_x] = 0x0000; // Map black module bits
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    qr_dynamic_bmp.header.magic = LV_IMAGE_HEADER_MAGIC;
+    qr_dynamic_bmp.header.cf = LV_COLOR_FORMAT_RGB565;
+    qr_dynamic_bmp.header.flags = 0;
+    qr_dynamic_bmp.header.w = display_dim;
+    qr_dynamic_bmp.header.h = display_dim;
+    qr_dynamic_bmp.header.stride = display_dim * 2;
+    qr_dynamic_bmp.header.reserved_2 = 0;
+    qr_dynamic_bmp.data_size = RGB565_SIZE;
+    qr_dynamic_bmp.data = qr_pixel_buffer;
+
+    if (example_lvgl_lock(-1)) {
+        if (qr_image_obj == NULL) {
+            qr_image_obj = lv_image_create(lv_screen_active());
+        }
+        
+        lv_image_set_src(qr_image_obj, NULL); 
+        lv_image_set_src(qr_image_obj, &qr_dynamic_bmp);
+        lv_obj_center(qr_image_obj);
+        lv_obj_clear_flag(qr_image_obj, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(qr_image_obj);
+        
+        example_lvgl_unlock();
+        ESP_LOGI("QR_UI", "Successfully pushed binary QR image payload onto layout engine matrix.");
+    }
+}
+
 static void wifi_prov_print_qr(const char *name, const char *username, const char *pop, const char *transport)
 {
 	if (!name || !transport)
@@ -645,12 +941,11 @@ static void wifi_prov_print_qr(const char *name, const char *username, const cha
 										   ",\"transport\":\"%s\",\"network\":\"wifi\"}",
 				 PROV_QR_VERSION, name, transport);
 	}
-	// TODO: Add the network protocol type to the QR code payload
-#ifdef CONFIG_EXAMPLE_PROV_SHOW_QR
+
 	ESP_LOGI(TAG, "Scan this QR code from the provisioning application for Provisioning.");
 	esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+	cfg.display_func = qr_code_lvgl_display_cb;
 	esp_qrcode_generate(&cfg, payload);
-#endif /* CONFIG_EXAMPLE_PROV_SHOW_QR */
 	ESP_LOGI(TAG, "If QR code is not visible, copy paste the below URL in a browser.\n%s?data=%s", QRCODE_BASE_URL, payload);
 }
 
@@ -717,47 +1012,131 @@ void led_test_task(void *arg)
 
 void display_update_task(void *arg)
 {
+	// 1. Allocate a persistent 80,000-byte raw RGB565 canvas in external PSRAM 
+	const size_t RGB565_SIZE = 80000; 
+	static uint8_t sd_pixel_buffer[RGB565_SIZE];// = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
+	assert(sd_pixel_buffer != NULL);
+	memset(sd_pixel_buffer, 0xFF, RGB565_SIZE); // Default to a pure white canvas
+
+	// 2. Set up our static descriptor wrapper pointing to our unpacked canvas area
+	static lv_image_dsc_t sd_dynamic_bmp = {
+		.header = {
+			.magic = LV_IMAGE_HEADER_MAGIC,
+			.cf = LV_COLOR_FORMAT_RGB565, // Tells the engine this is basic, uncompressed RGB565 data
+			.flags = 0,
+			.w = 200,
+			.h = 200,
+			.stride = 400,                // 200 pixels * 2 bytes per pixel
+			.reserved_2 = 0,
+		},
+		.data_size = RGB565_SIZE,
+		.data = sd_pixel_buffer
+	};
+
 	for (;;)
 	{
-		/* Wait for notification from a task */
+		/* Block indefinitely until notified by the download manager task  */
 		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
 
 		if (display_instructions.active)
 		{
-			ESP_LOGI(TAG, "New image ready for display: %s", display_instructions.data_path.c_str());
+			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", display_instructions.data_path.c_str());
 
-			// 2. Lock the UI thread before touching LVGL
-			if (example_lvgl_lock(-1))
+			FILE *f = fopen(display_instructions.data_path.c_str(), "rb");
+			if (f != NULL)
 			{
-				if (dynamic_epd_image != NULL)
+				// Step A: Skip the 12-byte LVGL header (we already know it's a 200x200 I8 file)
+				fseek(f, 12, SEEK_SET);
+
+				// Step B: Read the 1,024-byte Color Palette Table (256 colors * 4 bytes/color)
+				uint8_t palette[1024];
+				fread(palette, 1, 1024, f);
+
+				// Step C: Allocate temporary scratchpad memory to read the 40,000 pixel indices
+				uint8_t *indices = (uint8_t *)malloc(40000);
+				if (indices != NULL)
 				{
-					// 3. Format the path for LVGL (Prepend the LVGL Drive Letter 'A:')
-					// Example: "/sdcard/new_image.png" becomes "A:/sdcard/new_image.png"
-					std::string lvgl_path = "A:" + display_instructions.data_path;
+					fread(indices, 1, 40000, f);
+					fclose(f); // Close file handle immediately 
+					f = NULL;
 
-					// 4. Set the new image source
-					lv_image_set_src(dynamic_epd_image, lvgl_path.c_str());
+					// Step D: Translate the 8-bit index values to standard 16-bit RGB565 pixels
+					uint16_t *rgb565_dest = (uint16_t *)sd_pixel_buffer;
+					for (int i = 0; i < 40000; i++)
+					{
+						uint8_t idx = indices[i];
+						
+						// Extract individual Blue, Green, Red bytes from the 32-bit palette entry
+						uint8_t b = palette[idx * 4 + 0];
+						uint8_t g = palette[idx * 4 + 1];
+						uint8_t r = palette[idx * 4 + 2];
 
-					// 5. Unhide the widget if it was hidden at startup
-					lv_obj_clear_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
+						// Pack them into standard 16-bit RGB565 bit arrangements
+						rgb565_dest[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+					}
+					free(indices); // Clean up index scratchpad array
+
+					ESP_LOGI(TAG, "Unpacking complete. Pushing canvas to widget container...");
+
+					// 3. Lock the UI thread before updating live graphics elements 
+					if (example_lvgl_lock(-1))
+					{
+						if (dynamic_epd_image != NULL)
+						{
+							// Force reset and apply our unpacked memory canvas resource 
+							lv_image_set_src(dynamic_epd_image, NULL);
+							lv_image_set_src(dynamic_epd_image, &sd_dynamic_bmp);
+
+							// Unhide and target the layout boundaries for a refresh cycle 
+							lv_obj_clear_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
+							lv_obj_invalidate(dynamic_epd_image);
+						}
+						else
+						{
+							ESP_LOGE(TAG, "Widget Error: global variable 'dynamic_epd_image' is NULL! ");
+						}
+						
+						example_lvgl_unlock(); // Release the thread mutex lock 
+					}
+				}
+				else
+				{
+					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed.");
 				}
 
-				// 6. Release the UI lock
-				example_lvgl_unlock();
+				if (f != NULL) fclose(f);
+			}
+			else
+			{
+				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", display_instructions.data_path.c_str());
 			}
 
-			// 7. Reset the instruction flag so we don't reload it endlessly
-			display_instructions.active = false;
+			display_instructions.active = false; // Reset the operation flag 
 		}
-
-		// Sleep for 500ms before checking again (prevents CPU hogging)
-		vTaskDelay(pdMS_TO_TICKS(500));
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
 extern "C" void app_main(void)
 {
 	user_app_init();
+
+	bool dynamic_factory_reset = check_reset_button_at_boot();
+
+	if (dynamic_factory_reset)
+	{
+		ESP_LOGW(TAG, "=================================================");
+		ESP_LOGW(TAG, "FACTORY RESET TRIGGERED! Wiping system profiles...");
+		ESP_LOGW(TAG, "=================================================");
+		
+		// This completely wipes the default NVS partition where credentials live
+		ESP_ERROR_CHECK(nvs_flash_erase()); 
+
+	}
+
+	/* 	TODO: First thing read the state of a RESET GPIO 
+		If this RESET button is pressed, clear all provisioning info
+		So that the system can be re-provisioned	*/
 
 	SDCardConfig sd_config;
 	sd_config.mountPoint = "/sdcard";
@@ -773,22 +1152,7 @@ extern "C" void app_main(void)
 	if (sdcard->mount())
 	{
 		ESP_LOGI(TAG, "SD card mounted successfully. You can now perform file operations.");
-		// Use Posix style file reading as an example
-		FILE *file = fopen("/sdcard/hello.txt", "r");
-		if (file)
-		{
-			char buffer[128];
-			while (fgets(buffer, sizeof(buffer), file))
-			{
-				fileContent += buffer;
-			}
-			fclose(file);
-			ESP_LOGI(TAG, "Content of hello.txt:\n%s", fileContent.c_str());
-		}
-		else
-		{
-			ESP_LOGE(TAG, "Failed to open file on SD card.");
-		}
+		load_settings_from_json();
 	}
 	else
 	{
@@ -850,16 +1214,36 @@ extern "C" void app_main(void)
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+	ui_event_queue = xQueueCreate(10, sizeof(ui_event_type_t));
+
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 20 * 1024, NULL, 4, NULL, 1);
 	xTaskCreate(led_test_task, "led_test", 4096, NULL, 5, &notification_task_handle);
 	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
+	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
 
+	// 1. Initialize the UI and create widgets FIRST while holding the lock
 	if (example_lvgl_lock(-1))
 	{
-		user_ui_init();
+		user_ui_init(); // <--- Instantiates 'dynamic_epd_image' safely!
+
+		wifi_status_icon = lv_image_create(lv_screen_active());
+        lv_image_set_src(wifi_status_icon, &wifi_no); // Default to disconnected
+        
+        // Push to the top right corner with a 10px breathing padding
+        lv_obj_align(wifi_status_icon, LV_ALIGN_TOP_RIGHT, -10, 10);
+
 		example_lvgl_unlock();
 	}
+
+	// =================================================================
+    // 2. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready
+    // =================================================================
+    if (display_instructions.active && display_task_handle != NULL)
+    {
+        ESP_LOGI(TAG, "Boot configuration detected! Priming display loop...");
+        xTaskNotifyGive(display_task_handle);
+    }
 }
 
 static bool example_lvgl_lock(int timeout_ms)
@@ -1104,6 +1488,24 @@ static void wifi_prov_task(void *arg)
 
 	/* Wait for Wi-Fi connection */
 	xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+
+	// Clean up binary image representation asset
+	if (example_lvgl_lock(-1))
+	{
+		if (qr_image_obj != NULL)
+		{
+			ESP_LOGI(TAG, "Wi-Fi Up! Cleared binary image QR matrix widget.");
+			lv_obj_delete(qr_image_obj);
+			qr_image_obj = NULL;
+		}
+		if (qr_pixel_buffer != NULL)
+		{
+			heap_caps_free(qr_pixel_buffer);
+			qr_pixel_buffer = NULL;
+		}
+		lv_obj_invalidate(lv_screen_active());
+		example_lvgl_unlock();
+	}
 
 	/* Start main application now */
 #if CONFIG_EXAMPLE_REPROVISIONING
