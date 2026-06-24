@@ -33,8 +33,12 @@
 
 #include "driver/gpio.h"  // Ensure this header is included
 
+#include "rgb_led_strip.h"
+
 #define RESET_BUTTON_GPIO   GPIO_NUM_18  // Standard BOOT button on ESP32 Dev Kits
 #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
+
+#define RMT_LED_STRIP_GPIO_NUM gpio_num_t(3)
 
 // 2. Global Widget Pointers
 lv_obj_t *wifi_status_icon = NULL; // Overlay widget container
@@ -705,6 +709,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		/* get the download path and filename from the nested data object */
 		cJSON *path_item = cJSON_GetObjectItemCaseSensitive(data, "download");
 		cJSON *filename_item = cJSON_GetObjectItemCaseSensitive(data, "filename");
+		cJSON *message_item = cJSON_GetObjectItemCaseSensitive(data, "message");
 		if (!cJSON_IsString(path_item) || (path_item->valuestring == NULL) ||
 			!cJSON_IsString(filename_item) || (filename_item->valuestring == NULL))
 		{
@@ -733,6 +738,11 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		}
 
 		cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
+
+		// Print 'type' and 'message' fields for debugging
+		ESP_LOGI(TAG, "Command type: %s", cJSON_IsString(type) ? type->valuestring : "N/A");
+		ESP_LOGI(TAG, "Command message: %s", (message_item && cJSON_IsString(message_item)) ? message_item->valuestring : "N/A");
+
 		if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0)
 		{
 			ESP_LOGI(TAG, "Received display download command");
@@ -749,8 +759,16 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		}
 		else if (cJSON_IsString(type) && strcmp(type->valuestring, "notification") == 0)
 		{
-			ESP_LOGI(TAG, "Received notification download command");
-			notification_instructions.active = true;
+			if(message_item != NULL && cJSON_IsString(message_item) && message_item->valuestring != NULL)
+			{
+				ESP_LOGI(TAG, "Notification message: %s", message_item->valuestring);
+				notification_instructions.message = std::string(message_item->valuestring);
+				notification_instructions.active = true;
+			}
+			else
+			{
+				ESP_LOGW(TAG, "Notification command received without a valid 'message' field.");
+			}
 		}
 
 		cJSON_Delete(json);
@@ -981,32 +999,17 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
 
 void led_test_task(void *arg)
 {
-	gpio_config_t gpio_conf = {};
-	gpio_conf.intr_type = GPIO_INTR_DISABLE;
-	gpio_conf.mode = GPIO_MODE_OUTPUT;
-	gpio_conf.pin_bit_mask = 0x1ULL << 3;
-	gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-	gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-
-	ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
+	// Replace with the RGB LED strip functionality
+	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM); // Single RGB LED on GPIO 3
+	// Basic startup pattern to show the LED is working
+	led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
+	
+	int hue = 0;
 	for (;;)
 	{
-		if (notification_instructions.active)
-		{
-			ESP_LOGI(TAG, "Activating red notification LED");
-			for (int i = 0; i < 10; i++)
-			{
-				gpio_set_level((gpio_num_t)3, 0);
-				vTaskDelay(pdMS_TO_TICKS(100));
-				gpio_set_level((gpio_num_t)3, 1);
-				vTaskDelay(pdMS_TO_TICKS(100));
-			}
-			notification_instructions.active = false; // Reset the flag after notification
-		}
-		else
-		{
-			vTaskDelay(pdMS_TO_TICKS(1000)); // Sleep for a while when not active
-		}
+		hue = (hue + 5) % 360;
+		led_strip.runPattern(pattern_from_string(notification_instructions.message), hue, 100, 100);
+		vTaskDelay(pdMS_TO_TICKS(50));
 	}
 }
 
@@ -1218,7 +1221,8 @@ extern "C" void app_main(void)
 
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 20 * 1024, NULL, 4, NULL, 1);
-	xTaskCreate(led_test_task, "led_test", 4096, NULL, 5, &notification_task_handle);
+	// Led Task has the lowest priority so that it doesn't interfere with the UI and display tasks
+	xTaskCreate(led_test_task, "led_test", 4096, NULL, 14, &notification_task_handle);
 	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
 	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
 
@@ -1545,9 +1549,7 @@ static void wifi_prov_task(void *arg)
 
 	while (1)
 	{
-		// TODO: Dummy loop, needs to be changed later to do some actual work or can be removed if not needed
-		ESP_LOGI(TAG, "Hello World!");
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
+		vTaskDelay(pdMS_TO_TICKS(1000));
 	}
 #endif
 }
