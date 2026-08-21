@@ -27,11 +27,11 @@ Enable CONFIG_MQTT_PROTOCOL_5
     }
 }
 
-1. Add RGB control component
+1. Add RGB control component - Added to 0.2.0
 2. Upload factory updater firmware and test binary download and update functionality
 3. Long run test. Functional Test
 4. Body design and construction
 5. Clay skeleton 
-6. Base clay structure
+6. Base clay structure  
 7. Final top clay layer.
 8. Paint.
