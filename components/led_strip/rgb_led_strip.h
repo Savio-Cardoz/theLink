@@ -16,6 +16,7 @@
 #include "led_strip_encoder.h"
 
 enum class rgb_pattern_t {
+    OFF,
     SOLID_COLOR,
     RAINBOW_CYCLE,
     THEATER_CHASE,

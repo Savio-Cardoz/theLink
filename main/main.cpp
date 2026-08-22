@@ -1201,12 +1201,28 @@ static void handle_rgb_command(const char *payload)
 	}
 
 	cJSON *pattern = cJSON_GetObjectItemCaseSensitive(json, "pattern");
-	if (cJSON_IsString(pattern) && pattern->valuestring != NULL) {
+	cJSON *enable = cJSON_GetObjectItemCaseSensitive(json, "enable");
+	bool has_pattern = cJSON_IsString(pattern) && pattern->valuestring != NULL;
+	bool has_enable = cJSON_IsBool(enable);
+
+	if (!has_pattern && !has_enable) {
+		ESP_LOGW(TAG, "RGB command missing valid 'pattern' or 'enable' field");
+		cJSON_Delete(json);
+		return;
+	}
+
+	if (has_enable) {
+		bool enabled = cJSON_IsTrue(enable);
+		ESP_LOGI(TAG, "RGB lights: %s", enabled ? "ON" : "OFF");
+		set_notification_state(enabled);
+	}
+
+	if (has_pattern) {
 		ESP_LOGI(TAG, "RGB pattern: %s", pattern->valuestring);
 		set_notification_message(std::string(pattern->valuestring));
-		set_notification_state(true);
-	} else {
-		ESP_LOGW(TAG, "RGB command missing valid 'pattern' field");
+		if (!has_enable) {
+			set_notification_state(true);
+		}
 	}
 
 	cJSON_Delete(json);
@@ -1398,6 +1414,8 @@ void led_test_task(void *arg)
 	led_strip.runPattern(active_pattern, 0, 100, 100);
 
 	int hue = 0;
+	int saturation = 100;
+	int value = 100;
 	for (;;)
 	{
 		{
@@ -1410,6 +1428,8 @@ void led_test_task(void *arg)
 			{
 				active_pattern = rgb_pattern_t::SOLID_COLOR;
 				hue = 0;
+				saturation = 0;
+				value = 0;
 			}
 		}
 
@@ -1420,7 +1440,7 @@ void led_test_task(void *arg)
 		}
 		else
 		{
-			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
+			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, hue, saturation, value);
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(50));
