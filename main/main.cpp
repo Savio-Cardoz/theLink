@@ -226,6 +226,7 @@ std::string get_notification_message();
 
 // Global Handle for the Queue
 static QueueHandle_t download_cmd_queue = NULL;
+static IFileSystem *sdcard = nullptr;
 
 extern lv_obj_t *dynamic_epd_image;
 
@@ -539,6 +540,52 @@ static EventGroupHandle_t wifi_event_group;
 
 /* Event handler for catching system events */
 
+static void notify_download_handler(download_target_t target, bool success, const std::string &filepath)
+{
+	if (!success)
+	{
+		ESP_LOGE(TAG, "Failed to get file: %s", filepath.c_str());
+		return;
+	}
+
+	if (target == DOWNLOAD_TARGET_DISPLAY)
+	{
+		ESP_LOGI(TAG, "Updating display state with new data path: %s", filepath.c_str());
+		{
+			std::lock_guard<std::mutex> lock(display_state.mutex);
+			display_state.data_path = filepath;
+			display_state.active = true;
+		}
+		save_settings_to_json();
+		if (display_task_handle != NULL)
+		{
+			ESP_LOGI(TAG, "Notifying display task of new data path: %s", filepath.c_str());
+			xTaskNotifyGive(display_task_handle);
+		}
+	}
+	else if (target == DOWNLOAD_TARGET_AUDIO)
+	{
+		ESP_LOGI(TAG, "Updating audio state with new file: %s", filepath.c_str());
+		std::string filename = filepath;
+		size_t slash = filename.rfind('/');
+		if (slash != std::string::npos)
+		{
+			filename = filename.substr(slash + 1);
+		}
+		{
+			std::lock_guard<std::mutex> lock(audio_state.mutex);
+			strncpy(audio_state.filename, filename.c_str(), sizeof(audio_state.filename) - 1);
+			audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
+			audio_state.active = true;
+		}
+		if (audio_task_handle != NULL)
+		{
+			ESP_LOGI(TAG, "Notifying audio task of new file: %s", audio_state.filename);
+			xTaskNotifyGive(audio_task_handle);
+		}
+	}
+}
+
 static void download_orchestrator_task(void *arg)
 {
 	ESP_LOGI(TAG, "Download Orchestrator Task Started");
@@ -558,61 +605,29 @@ static void download_orchestrator_task(void *arg)
 			std::string urlStr(incoming_cmd.url);
 			std::string fileStr("/sdcard/" + std::string(incoming_cmd.filename));
 
-			// Trigger the download
-			log_heap_info("orchestrator before startDownload");
-			download_target_t dl_target = incoming_cmd.target;
-			bool success = downloader.startDownload(urlStr, fileStr, [dl_target](bool success, const std::string &filepath)
-													{
-				if (success)
-				{
-					ESP_LOGI(TAG, "Download completed successfully: %s", filepath.c_str());
-
-					if (dl_target == DOWNLOAD_TARGET_DISPLAY)
-					{
-						ESP_LOGI(TAG, "Updating display state with new data path: %s", filepath.c_str());
-						{
-							std::lock_guard<std::mutex> lock(display_state.mutex);
-							display_state.data_path = filepath;
-							display_state.active = true;
-						}
-						save_settings_to_json();
-						if(display_task_handle != NULL)
-						{
-							ESP_LOGI(TAG, "Notifying display task of new data path: %s", filepath.c_str());
-							xTaskNotifyGive(display_task_handle);
-						}
-					}
-					else if (dl_target == DOWNLOAD_TARGET_AUDIO)
-					{
-						ESP_LOGI(TAG, "Updating audio state with new file: %s", filepath.c_str());
-						// Extract just the filename from the full path for the audio task
-						std::string fname = filepath;
-						size_t slash = fname.rfind('/');
-						if (slash != std::string::npos) {
-							fname = fname.substr(slash + 1);
-						}
-						{
-							std::lock_guard<std::mutex> lock(audio_state.mutex);
-							strncpy(audio_state.filename, fname.c_str(), sizeof(audio_state.filename) - 1);
-							audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
-							audio_state.active = true;
-						}
-						if(audio_task_handle != NULL)
-						{
-							ESP_LOGI(TAG, "Notifying audio task of new file: %s", audio_state.filename);
-							xTaskNotifyGive(audio_task_handle);
-						}
-					}
-				}
-				else
-				{
-					ESP_LOGE(TAG, "Download failed for file: %s", filepath.c_str());
-				} });
-
-			if (!success)
+			if (sdcard == nullptr || !sdcard->isMounted())
 			{
-				ESP_LOGE(TAG, "Failed to start download. Is one already active?");
+				ESP_LOGE(TAG, "Cannot get %s: SD card is unavailable", incoming_cmd.filename);
+				continue;
 			}
+
+			download_target_t dl_target = incoming_cmd.target;
+			if (sdcard->fileExists(incoming_cmd.filename))
+			{
+				ESP_LOGI(TAG, "File already available at: %s", fileStr.c_str());
+				notify_download_handler(dl_target, true, fileStr);
+				continue;
+			}
+
+			log_heap_info("orchestrator before startDownload");
+		ESP_LOGI(TAG, "%s not found. Starting download", fileStr.c_str());
+		if (!downloader.startDownload(urlStr, fileStr, [dl_target](bool success, const std::string &filepath)
+			{
+				notify_download_handler(dl_target, success, filepath);
+			}))
+		{
+			ESP_LOGE(TAG, "Failed to start download for file: %s", fileStr.c_str());
+		}
 
 			// Note: startDownload spawns its own FreeRTOS tasks and returns immediately.
 			// If you only want one download at a time, you may need to add logic here
@@ -1561,7 +1576,7 @@ extern "C" void app_main(void)
 	sd_config.pinClk = SDMMC_CLK_PIN;
 	sd_config.pinD0 = SDMMC_D0_PIN;
 
-	IFileSystem *sdcard = new SDCardManager(sd_config);
+	sdcard = new SDCardManager(sd_config);
 	std::string fileContent;
 
 	if (sdcard->mount())
