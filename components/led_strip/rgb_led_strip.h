@@ -228,7 +228,7 @@ private:
         strip.flush();
     }},
     {rgb_pattern_t::RAINBOW_CYCLE, [](RgbLedStrip& strip, uint32_t h, uint32_t s, uint32_t v) {
-        for (size_t i = 0; i < 16; ++i) {
+        for (size_t i = 0; i < size; ++i) {
             strip.setHsvAt(i, (h + i * 360 / 16) % 360, s, v);
         }
         strip.flush();

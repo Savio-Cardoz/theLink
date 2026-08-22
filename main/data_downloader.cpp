@@ -1,6 +1,7 @@
 #include "data_downloader.hpp"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include <inttypes.h>
 // #include "esp_cert_bundle.h"
 
 static const char *TAG = "ASYNC_DL";
@@ -55,7 +56,8 @@ void AsyncDownloader::runStorageTask()
     }
 
     fclose(file);
-    ESP_LOGI(TAG, "Storage Task: File closed. Shutting down.");
+    ESP_LOGI(TAG, "Storage Task: File closed. Shutting down. Stack HWM=%" PRIu32,
+			 (uint32_t)uxTaskGetStackHighWaterMark(NULL));
 
     if (onCompleteCallback)
     {
@@ -69,9 +71,11 @@ void AsyncDownloader::runStorageTask()
 void AsyncDownloader::runHttpTask()
 {
     uint8_t txBuffer[CHUNK_SIZE];
-    ESP_LOGI(TAG, "HTTP Task: Starting download from %s", currentUrl.c_str());
+	ESP_LOGI(TAG, "HTTP Task: Starting download from %s", currentUrl.c_str());
+	ESP_LOGI(TAG, "[HEAP] before esp_http_client_init: free=%" PRIu32 ", min_free=%" PRIu32,
+			 esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
 
-    // 1. Configure the HTTP Client
+	// 1. Configure the HTTP Client
     esp_http_client_config_t config = {};
     config.url = currentUrl.c_str();
     // IMPORTANT: For production HTTPS, you must provide a CA certificate!
@@ -80,6 +84,7 @@ void AsyncDownloader::runHttpTask()
     config.timeout_ms = 10000;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
+    ESP_LOGI(TAG, "HTTP Task: Client initialized @ %p", client);
     if (!client)
     {
         ESP_LOGE(TAG, "HTTP Task: Failed to initialize client");
@@ -90,6 +95,9 @@ void AsyncDownloader::runHttpTask()
 
     // 2. Open the connection manually (bypasses the event handler)
     esp_err_t err = esp_http_client_open(client, 0);
+	ESP_LOGI(TAG, "HTTP Task: Connection opened: %s", esp_err_to_name(err));
+	ESP_LOGI(TAG, "[HEAP] after esp_http_client_open: free=%" PRIu32 ", min_free=%" PRIu32,
+			 esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "HTTP Task: Failed to open connection: %s", esp_err_to_name(err));
@@ -101,6 +109,7 @@ void AsyncDownloader::runHttpTask()
 
     // 3. Fetch headers to get the file size
     int content_length = esp_http_client_fetch_headers(client);
+    ESP_LOGI(TAG, "HTTP Task: Fetched headers. Content length: %d", content_length);
     if (content_length <= 0)
     {
         ESP_LOGW(TAG, "HTTP Task: Server didn't provide content length. Streaming until EOF.");
@@ -121,6 +130,7 @@ void AsyncDownloader::runHttpTask()
         }
 
         int bytesRead = esp_http_client_read(client, (char *)txBuffer, CHUNK_SIZE);
+        ESP_LOGI(TAG, "HTTP Task: Read %d bytes", bytesRead);
 
         if (bytesRead < 0)
         {
@@ -153,7 +163,8 @@ void AsyncDownloader::runHttpTask()
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    ESP_LOGI(TAG, "HTTP Task: Complete. Total downloaded: %d. Signaling storage task.", totalBytesDownloaded);
+    ESP_LOGI(TAG, "HTTP Task: Complete. Total downloaded: %d. Signaling storage task. Stack HWM=%" PRIu32,
+			 totalBytesDownloaded, (uint32_t)uxTaskGetStackHighWaterMark(NULL));
 
     // Signal storage task to finish up
     isDownloadActive = false;
@@ -181,6 +192,11 @@ AsyncDownloader::~AsyncDownloader()
 // --- 3. The Orchestrator ---
 bool AsyncDownloader::startDownload(const std::string &url, const std::string &filename, DownloadCallback_t callback)
 {
+    if (streamBuffer == nullptr)
+    {
+        ESP_LOGW(TAG, "Download unavailable: stream buffer is not initialized");
+        return false;
+    }
     if (isDownloadActive)
     {
         ESP_LOGW(TAG, "Download already in progress!");
@@ -194,11 +210,24 @@ bool AsyncDownloader::startDownload(const std::string &url, const std::string &f
 
     xStreamBufferReset(streamBuffer);
 
-    // Spawn Storage Task
-    xTaskCreate(storageTaskWrapper, "StorageTask", 8192, this, 5, &storageTaskHandle);
+    // ESP-IDF measures xTaskCreate stack depth in bytes. FatFS and the 2 KiB
+    // transfer buffer require more than the minimum task stack here.
+    auto ret = xTaskCreate(storageTaskWrapper, "StorageTask", 8192, this, 5, &storageTaskHandle);
+    ESP_LOGI(TAG, "Storage Task launch returned %s", ret == pdPASS ? "pdPASS" : "pdFAIL");
+    if (ret != pdPASS)
+    {
+        isDownloadActive = false;
+        return false;
+    }
 
     // Spawn HTTP Task
-    xTaskCreate(httpTaskWrapper, "HttpTask", 8192, this, 4, &httpTaskHandle);
+    auto ret2 = xTaskCreate(httpTaskWrapper, "HttpTask", 8192, this, 4, &httpTaskHandle);
+    ESP_LOGI(TAG, "HTTP Task launch returned %s", ret2 == pdPASS ? "pdPASS" : "pdFAIL");
+    if (ret2 != pdPASS)
+    {
+        isDownloadActive = false;
+        return false;
+    }
 
     return true;
 }

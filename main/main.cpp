@@ -21,6 +21,8 @@
 #include "qrcode.h"
 
 #include "mqtt_client.h"
+#include <map>
+#include <functional>
 
 #include "freertos/queue.h"
 #include "cJSON.h" // Strongly recommended for parsing the MQTT payload
@@ -32,13 +34,77 @@
 #include "user_config.h"
 
 #include "driver/gpio.h"  // Ensure this header is included
+#include "esp_heap_caps.h"
 
 #include "rgb_led_strip.h"
+#include "mqtt_logger.h"
+#include "esp_mac.h"
+#include "audio_bsp.h"
+#include "codec_init.h"
+
+#include <mutex>
+#include <cstring>
 
 #define RESET_BUTTON_GPIO   GPIO_NUM_18  // Standard BOOT button on ESP32 Dev Kits
 #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
 
 #define RMT_LED_STRIP_GPIO_NUM gpio_num_t(3)
+
+// Device ID and MQTT topics are derived from WiFi MAC at runtime.
+// Populated by device_id_init() early in app_main.
+#define DEVICE_ID_MAX_LEN      32
+#define MQTT_TOPIC_MAX_LEN     64
+
+static char s_device_id[DEVICE_ID_MAX_LEN];
+static char s_mqtt_cmd_topic_base[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_topic_base[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_log_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_display_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_rgb_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_audio_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_notification_topic[MQTT_TOPIC_MAX_LEN];
+
+static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
+
+/**
+ * @brief Read the base MAC address and build the device ID and MQTT topics.
+ *
+ * Uses esp_efuse_mac_get_default() so this can run before WiFi init.
+ * Format: "thelink-XXYYZZ" where XX, YY, ZZ are the last 3 bytes of the MAC.
+ * Topics follow: "thelink/<device_id>/cmd/log", etc.
+ */
+static void device_id_init(void)
+{
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+
+    // Device ID: "thelink-XXYYZZ"
+    snprintf(s_device_id, sizeof(s_device_id), "thelink-%02X%02X%02X",
+             mac[3], mac[4], mac[5]);
+
+    // Topic paths
+    snprintf(s_mqtt_cmd_topic_base, sizeof(s_mqtt_cmd_topic_base),
+             "thelink/%s/cmd/", s_device_id);
+    snprintf(s_mqtt_evt_topic_base, sizeof(s_mqtt_evt_topic_base),
+             "thelink/%s/evt/", s_device_id);
+    snprintf(s_mqtt_cmd_log_topic, sizeof(s_mqtt_cmd_log_topic),
+             "thelink/%s/cmd/log", s_device_id);
+    snprintf(s_mqtt_cmd_display_topic, sizeof(s_mqtt_cmd_display_topic),
+             "thelink/%s/cmd/display", s_device_id);
+    snprintf(s_mqtt_cmd_rgb_topic, sizeof(s_mqtt_cmd_rgb_topic),
+             "thelink/%s/cmd/rgb", s_device_id);
+    snprintf(s_mqtt_cmd_audio_topic, sizeof(s_mqtt_cmd_audio_topic),
+             "thelink/%s/cmd/audio", s_device_id);
+    snprintf(s_mqtt_cmd_notification_topic, sizeof(s_mqtt_cmd_notification_topic),
+             "thelink/%s/cmd/notification", s_device_id);
+
+    ESP_LOGI("DEVICE", "Device ID: %s", s_device_id);
+    ESP_LOGI("DEVICE", "Log cmd topic: %s", s_mqtt_cmd_log_topic);
+    ESP_LOGI("DEVICE", "Display cmd topic: %s", s_mqtt_cmd_display_topic);
+    ESP_LOGI("DEVICE", "RGB cmd topic: %s", s_mqtt_cmd_rgb_topic);
+    ESP_LOGI("DEVICE", "Audio cmd topic: %s", s_mqtt_cmd_audio_topic);
+    ESP_LOGI("DEVICE", "Notification cmd topic: %s", s_mqtt_cmd_notification_topic);
+}
 
 // 2. Global Widget Pointers
 lv_obj_t *wifi_status_icon = NULL; // Overlay widget container
@@ -99,31 +165,64 @@ static lv_obj_t *qr_image_obj = NULL;
 // Queue to safely pass state transitions to the LVGL thread
 static QueueHandle_t ui_event_queue = NULL;
 
+// Download target routing
+typedef enum {
+	DOWNLOAD_TARGET_DISPLAY,
+	DOWNLOAD_TARGET_AUDIO
+} download_target_t;
+
 // The structure passed through the FreeRTOS Queue
 typedef struct
 {
 	char url[MAX_URL_LEN];
 	char filename[MAX_FILE_LEN];
+	download_target_t target;
 } DownloadCommand_t;
 
-typedef struct instructions_struct
-{
-	bool active;
-	std::string data_path;
-	uint32_t run_interval;
-	bool repeat;
-	std::string message;
-} instructions_t;
+// ── Per-subsystem typed state structs ────────────────────────────────
 
-instructions_t display_instructions;
-instructions_t rgb_instructions;
-instructions_t audio_instructions;
-instructions_t notification_instructions;
+struct display_state_t {
+	bool active;
+	std::mutex mutex;
+	std::string data_path;
+	uint32_t cmd_id;
+};
+
+struct led_state_t {
+	bool active;
+	std::mutex mutex;
+	rgb_pattern_t pattern;
+	char pattern_name[32];
+	uint8_t hue;
+	uint8_t saturation;
+	uint8_t value;
+	uint32_t cmd_id;
+};
+
+struct audio_state_t {
+	bool active;
+	std::mutex mutex;
+	char filename[64];
+	uint8_t volume;
+	uint32_t cmd_id;
+};
+
+display_state_t display_state;
+led_state_t led_state;
+audio_state_t audio_state;
+
+std::mutex notification_mutex;
 
 TaskHandle_t display_task_handle = NULL;
 TaskHandle_t rgb_task_handle = NULL;
 TaskHandle_t audio_task_handle = NULL;
 TaskHandle_t notification_task_handle = NULL;
+
+// Forward declarations for notification getter/setters
+bool get_notification_state();
+void set_notification_state(bool state);
+void set_notification_message(const std::string &message);
+std::string get_notification_message();
 
 // Global Handle for the Queue
 static QueueHandle_t download_cmd_queue = NULL;
@@ -131,6 +230,16 @@ static QueueHandle_t download_cmd_queue = NULL;
 extern lv_obj_t *dynamic_epd_image;
 
 static const char *TAG = "app";
+
+static void log_heap_info(const char *context)
+{
+	uint32_t total_free = esp_get_free_heap_size();
+	uint32_t total_min = esp_get_minimum_free_heap_size();
+	uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	uint32_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	ESP_LOGI(TAG, "[HEAP] %s: total_free=%" PRIu32 ", total_min=%" PRIu32 " | INTERNAL free=%" PRIu32 ", largest_blk=%" PRIu32,
+			 context, total_free, total_min, int_free, int_largest);
+}
 
 // Wifi provisioning definitions
 #if CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
@@ -178,10 +287,13 @@ void save_settings_to_json(void)
     cJSON *root = cJSON_CreateObject();
     
     // Add display path string
-    cJSON_AddStringToObject(root, "display", display_instructions.data_path.c_str());
+    {
+        std::lock_guard<std::mutex> lock(display_state.mutex);
+        cJSON_AddStringToObject(root, "display", display_state.data_path.c_str());
+    }
     
     // Add LED pattern state status string
-    cJSON_AddStringToObject(root, "led", notification_instructions.active ? "active" : "inactive");
+    cJSON_AddStringToObject(root, "led", get_notification_state() ? "active" : "inactive");
 
     char *json_str = cJSON_Print(root);
     if (json_str != NULL)
@@ -230,16 +342,16 @@ void load_settings_from_json(void)
             cJSON *display_item = cJSON_GetObjectItemCaseSensitive(json, "display");
             if (cJSON_IsString(display_item) && (display_item->valuestring != NULL))
             {
-                display_instructions.data_path = std::string(display_item->valuestring);
-                display_instructions.active = true; // Flag for boot processing
-                ESP_LOGI("CONFIG", "Restored display state path: %s", display_instructions.data_path.c_str());
+                display_state.data_path = std::string(display_item->valuestring);
+                display_state.active = true;
+                ESP_LOGI("CONFIG", "Restored display state path: %s", display_state.data_path.c_str());
             }
 
             // Parse and apply LED notification parameters
             cJSON *led_item = cJSON_GetObjectItemCaseSensitive(json, "led");
             if (cJSON_IsString(led_item) && (led_item->valuestring != NULL))
             {
-                notification_instructions.active = (strcmp(led_item->valuestring, "active") == 0);
+				set_notification_state(strcmp(led_item->valuestring, "active") == 0);
                 ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
             }
 
@@ -444,23 +556,52 @@ static void download_orchestrator_task(void *arg)
 
 			// Convert standard C arrays to std::string for the C++ class
 			std::string urlStr(incoming_cmd.url);
-			std::string fileStr(incoming_cmd.filename);
+			std::string fileStr("/sdcard/" + std::string(incoming_cmd.filename));
 
 			// Trigger the download
-			bool success = downloader.startDownload(urlStr, fileStr, [](bool success, const std::string &filepath)
+			log_heap_info("orchestrator before startDownload");
+			download_target_t dl_target = incoming_cmd.target;
+			bool success = downloader.startDownload(urlStr, fileStr, [dl_target](bool success, const std::string &filepath)
 													{
 				if (success)
 				{
 					ESP_LOGI(TAG, "Download completed successfully: %s", filepath.c_str());
-					display_instructions.data_path = filepath; // Update the display instructions with the new file path
-					display_instructions.active = true; // Signal the display task to show the new image
 
-					save_settings_to_json();
-					// Note: In a real application, you might want to use a more robust method
-					// to signal the display task, such as a FreeRTOS event group or direct task notification.
-					if(display_task_handle != NULL)
+					if (dl_target == DOWNLOAD_TARGET_DISPLAY)
 					{
-						xTaskNotifyGive(display_task_handle); // Notify the display task that new data is available
+						ESP_LOGI(TAG, "Updating display state with new data path: %s", filepath.c_str());
+						{
+							std::lock_guard<std::mutex> lock(display_state.mutex);
+							display_state.data_path = filepath;
+							display_state.active = true;
+						}
+						save_settings_to_json();
+						if(display_task_handle != NULL)
+						{
+							ESP_LOGI(TAG, "Notifying display task of new data path: %s", filepath.c_str());
+							xTaskNotifyGive(display_task_handle);
+						}
+					}
+					else if (dl_target == DOWNLOAD_TARGET_AUDIO)
+					{
+						ESP_LOGI(TAG, "Updating audio state with new file: %s", filepath.c_str());
+						// Extract just the filename from the full path for the audio task
+						std::string fname = filepath;
+						size_t slash = fname.rfind('/');
+						if (slash != std::string::npos) {
+							fname = fname.substr(slash + 1);
+						}
+						{
+							std::lock_guard<std::mutex> lock(audio_state.mutex);
+							strncpy(audio_state.filename, fname.c_str(), sizeof(audio_state.filename) - 1);
+							audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
+							audio_state.active = true;
+						}
+						if(audio_task_handle != NULL)
+						{
+							ESP_LOGI(TAG, "Notifying audio task of new file: %s", audio_state.filename);
+							xTaskNotifyGive(audio_task_handle);
+						}
 					}
 				}
 				else
@@ -634,6 +775,24 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 	}
 }
 
+// ── MQTT command dispatch table (topic -> handler) ─────────────────
+
+static void handle_display_command(const char *payload);
+static void handle_rgb_command(const char *payload);
+static void handle_audio_command(const char *payload);
+static void handle_notification_command(const char *payload);
+
+static std::map<std::string, std::function<void(const char *)>> s_cmd_dispatch;
+
+static void mqtt_dispatch_init(void)
+{
+	s_cmd_dispatch[s_mqtt_cmd_log_topic] = mqtt_logger_handle_command;
+	s_cmd_dispatch[s_mqtt_cmd_display_topic] = handle_display_command;
+	s_cmd_dispatch[s_mqtt_cmd_rgb_topic] = handle_rgb_command;
+	s_cmd_dispatch[s_mqtt_cmd_audio_topic] = handle_audio_command;
+	s_cmd_dispatch[s_mqtt_cmd_notification_topic] = handle_notification_command;
+}
+
 /*
  * @brief Event handler registered to receive MQTT events
  *
@@ -656,8 +815,26 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 	{
 	case MQTT_EVENT_CONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+		s_mqtt_client = client;
+
+		// Subscribe to per-device command topics
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_display_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_display_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_rgb_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_rgb_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_audio_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_audio_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_notification_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_notification_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_log_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_log_topic, msg_id);
+
+		// Legacy topic for backward compatibility
 		msg_id = esp_mqtt_client_subscribe(client, CONFIG_COMMAND_TOPIC, 2);
-		ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+		ESP_LOGI(TAG, "subscribed to legacy %s, msg_id=%d", CONFIG_COMMAND_TOPIC, msg_id);
+
+		// Initialise MQTT logger
+		mqtt_logger_init(client, s_device_id, MQTT_LOG_INFO, 16);
 		break;
 	case MQTT_EVENT_DISCONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -673,9 +850,8 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		break;
 	case MQTT_EVENT_DATA:
 	{
-		ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-		ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
-		ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
+		ESP_LOGD(TAG, "MQTT_EVENT_DATA");
+		ESP_LOGD(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
 
 		// Ensure the payload is null-terminated for parsing
 		char *payload = (char *)malloc(event->data_len + 1);
@@ -688,90 +864,18 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		memcpy(payload, event->data, event->data_len);
 		payload[event->data_len] = '\0';
 
-		/* Parse JSON and pass to be processed based on command */
-		cJSON *json = cJSON_Parse(payload);
-		if (json == NULL)
+		// ── Topic-based dispatch via lookup table ────────────────────────
+		std::string topic(event->topic, event->topic_len);
+		auto it = s_cmd_dispatch.find(topic);
+		if (it != s_cmd_dispatch.end())
 		{
-			ESP_LOGE(TAG, "Failed to parse JSON payload");
-			free(payload);
-			return;
+			it->second(payload);
+		}
+		else
+		{
+			ESP_LOGW(TAG, "No handler for topic: %.*s", event->topic_len, event->topic);
 		}
 
-		cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
-		if (!cJSON_IsObject(data))
-		{
-			ESP_LOGE(TAG, "Invalid or missing 'data' object in JSON");
-			cJSON_Delete(json);
-			free(payload);
-			return;
-		}
-
-		/* get the download path and filename from the nested data object */
-		cJSON *path_item = cJSON_GetObjectItemCaseSensitive(data, "download");
-		cJSON *filename_item = cJSON_GetObjectItemCaseSensitive(data, "filename");
-		cJSON *message_item = cJSON_GetObjectItemCaseSensitive(data, "message");
-		if (!cJSON_IsString(path_item) || (path_item->valuestring == NULL) ||
-			!cJSON_IsString(filename_item) || (filename_item->valuestring == NULL))
-		{
-			ESP_LOGE(TAG, "Invalid or missing 'download' or 'filename' field in JSON");
-			cJSON_Delete(json);
-			free(payload);
-			return;
-		}
-
-		if (path_item->valuestring[0] == 'h')
-		{
-			ESP_LOGI(TAG, "Download path: %s", path_item->valuestring);
-			DownloadCommand_t cmd;
-			memset(&cmd, 0, sizeof(DownloadCommand_t));
-			strncpy(cmd.url, path_item->valuestring, MAX_URL_LEN - 1);
-			strncpy(cmd.filename, filename_item->valuestring, MAX_FILE_LEN - 1); // Example filename, adjust as needed
-
-			if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
-			{
-				ESP_LOGE(TAG, "Download queue is full! Dropping command.");
-			}
-			else
-			{
-				ESP_LOGI(TAG, "Download command enqueued successfully.");
-			}
-		}
-
-		cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
-
-		// Print 'type' and 'message' fields for debugging
-		ESP_LOGI(TAG, "Command type: %s", cJSON_IsString(type) ? type->valuestring : "N/A");
-		ESP_LOGI(TAG, "Command message: %s", (message_item && cJSON_IsString(message_item)) ? message_item->valuestring : "N/A");
-
-		if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0)
-		{
-			ESP_LOGI(TAG, "Received display download command");
-			display_instructions.active = true;
-			display_instructions.data_path = "/sdcard/" + std::string(filename_item->valuestring);
-		}
-		else if (cJSON_IsString(type) && strcmp(type->valuestring, "rgb") == 0)
-		{
-			ESP_LOGI(TAG, "Received RGB download command");
-		}
-		else if (cJSON_IsString(type) && strcmp(type->valuestring, "audio") == 0)
-		{
-			ESP_LOGI(TAG, "Received audio download command");
-		}
-		else if (cJSON_IsString(type) && strcmp(type->valuestring, "notification") == 0)
-		{
-			if(message_item != NULL && cJSON_IsString(message_item) && message_item->valuestring != NULL)
-			{
-				ESP_LOGI(TAG, "Notification message: %s", message_item->valuestring);
-				notification_instructions.message = std::string(message_item->valuestring);
-				notification_instructions.active = true;
-			}
-			else
-			{
-				ESP_LOGW(TAG, "Notification command received without a valid 'message' field.");
-			}
-		}
-
-		cJSON_Delete(json);
 		free(payload);
 	}
 	break;
@@ -803,6 +907,7 @@ static void mqtt5_app_start(void)
 	mqtt5_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
 
 	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
+	s_mqtt_client = client;
 
 	/* TODO: Remove commented lines of code*/
 	/* Set connection properties and user properties */
@@ -997,55 +1102,358 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
 };
 #endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
 
+bool get_notification_state()
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	return led_state.active;
+}
+
+void set_notification_state(bool state)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	led_state.active = state;
+}
+
+void set_notification_message(const std::string &message)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	strncpy(led_state.pattern_name, message.c_str(), sizeof(led_state.pattern_name) - 1);
+	led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+	led_state.pattern = pattern_from_string(message);
+}
+
+std::string get_notification_message()
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	return std::string(led_state.pattern_name);
+}
+
+// ── Per-topic MQTT command handlers ────────────────────────────────
+
+static void handle_display_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Display command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Display: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *filename = cJSON_GetObjectItemCaseSensitive(json, "filename");
+
+	if (!cJSON_IsString(download) || !cJSON_IsString(filename)) {
+		ESP_LOGW(TAG, "Display command missing 'download' or 'filename'");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Display download: %s -> %s", download->valuestring, filename->valuestring);
+	log_heap_info("handle_display_command");
+
+	// Enqueue download if URL is present
+	if (download->valuestring[0] == 'h') {
+		DownloadCommand_t cmd;
+		memset(&cmd, 0, sizeof(DownloadCommand_t));
+		strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+		strncpy(cmd.filename, filename->valuestring, MAX_FILE_LEN - 1);
+		cmd.target = DOWNLOAD_TARGET_DISPLAY;
+
+		if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+			ESP_LOGE(TAG, "Display: download queue full, dropping command");
+		}
+	}
+
+	// Set display state
+	{
+		std::lock_guard<std::mutex> lock(display_state.mutex);
+		display_state.active = true;
+		display_state.data_path = "/sdcard/" + std::string(filename->valuestring);
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_rgb_command(const char *payload)
+{
+	ESP_LOGI(TAG, "RGB command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "RGB: invalid JSON");
+		return;
+	}
+
+	cJSON *pattern = cJSON_GetObjectItemCaseSensitive(json, "pattern");
+	if (cJSON_IsString(pattern) && pattern->valuestring != NULL) {
+		ESP_LOGI(TAG, "RGB pattern: %s", pattern->valuestring);
+		set_notification_message(std::string(pattern->valuestring));
+		set_notification_state(true);
+	} else {
+		ESP_LOGW(TAG, "RGB command missing valid 'pattern' field");
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_audio_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Audio command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Audio: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *filename = cJSON_GetObjectItemCaseSensitive(json, "filename");
+	cJSON *volume = cJSON_GetObjectItemCaseSensitive(json, "volume");
+
+	if (!cJSON_IsString(download) || !cJSON_IsString(filename)) {
+		ESP_LOGW(TAG, "Audio command missing 'download' or 'filename'");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Audio download: %s -> %s", download->valuestring, filename->valuestring);
+
+	if (cJSON_IsNumber(volume)) {
+		std::lock_guard<std::mutex> lock(audio_state.mutex);
+		audio_state.volume = (uint8_t)volume->valueint;
+	}
+
+	// Enqueue download if URL is present
+	if (download->valuestring[0] == 'h') {
+		DownloadCommand_t cmd;
+		memset(&cmd, 0, sizeof(DownloadCommand_t));
+		strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+		strncpy(cmd.filename, filename->valuestring, MAX_FILE_LEN - 1);
+		cmd.target = DOWNLOAD_TARGET_AUDIO;
+
+		if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+			ESP_LOGE(TAG, "Audio: download queue full, dropping command");
+		}
+	} else {
+		// No download URL — file already on SD card, play directly
+		std::lock_guard<std::mutex> lock(audio_state.mutex);
+		strncpy(audio_state.filename, filename->valuestring, sizeof(audio_state.filename) - 1);
+		audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
+		audio_state.active = true;
+
+		if (audio_task_handle != NULL) {
+			xTaskNotifyGive(audio_task_handle);
+		}
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_notification_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Notification command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Notification: invalid JSON");
+		return;
+	}
+
+	cJSON *message = cJSON_GetObjectItemCaseSensitive(json, "message");
+	if (cJSON_IsString(message) && message->valuestring != NULL) {
+		ESP_LOGI(TAG, "Notification message: %s", message->valuestring);
+		set_notification_message(std::string(message->valuestring));
+		set_notification_state(true);
+	} else {
+		ESP_LOGW(TAG, "Notification command missing valid 'message' field");
+	}
+
+	cJSON_Delete(json);
+}
+
+// ── Audio playback task ───────────────────────────────────────────
+
+static void audio_playback_task(void *arg)
+{
+	ESP_LOGI(TAG, "Audio playback task started");
+
+	audio_bsp_init();
+	esp_codec_dev_sample_info_t fs = {};
+	fs.sample_rate = 16000;
+	fs.channel = 2;
+	fs.bits_per_sample = 16;
+	esp_codec_dev_handle_t playback = get_playback_handle();
+
+	for (;;)
+	{
+		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+
+		bool should_play = false;
+		char filename[64] = {0};
+		uint8_t volume = 80;
+		{
+			std::lock_guard<std::mutex> lock(audio_state.mutex);
+			if (audio_state.active)
+			{
+				should_play = true;
+				strncpy(filename, audio_state.filename, sizeof(filename) - 1);
+				volume = audio_state.volume;
+				audio_state.active = false;
+			}
+		}
+
+		if (!should_play)
+			continue;
+
+		ESP_LOGI(TAG, "Audio play: %s (vol=%d)", filename, volume);
+		esp_codec_dev_set_out_vol(playback, (float)volume);
+
+		if (strcmp(filename, "boot") == 0)
+		{
+			extern const uint8_t music_pcm_start[] asm("_binary_canon_pcm_start");
+			extern const uint8_t music_pcm_end[]   asm("_binary_canon_pcm_end");
+			size_t pcm_size = music_pcm_end - music_pcm_start;
+			uint8_t *pcm_ptr = (uint8_t *)music_pcm_start;
+
+			if (esp_codec_dev_open(playback, &fs) == ESP_CODEC_DEV_OK)
+			{
+				size_t written = 0;
+				while (written < pcm_size)
+				{
+					esp_codec_dev_write(playback, pcm_ptr + written, 256);
+					written += 256;
+				}
+			}
+			esp_codec_dev_close(playback);
+			ESP_LOGI(TAG, "Boot sound playback complete");
+		}
+		else
+		{
+			std::string file_path = "/sdcard/" + std::string(filename);
+			FILE *f = fopen(file_path.c_str(), "rb");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Audio: cannot open %s", file_path.c_str());
+				continue;
+			}
+
+			if (esp_codec_dev_open(playback, &fs) == ESP_CODEC_DEV_OK)
+			{
+				uint8_t buf[1024];
+				size_t bytes_read;
+				while ((bytes_read = fread(buf, 1, sizeof(buf), f)) > 0)
+				{
+					esp_codec_dev_write(playback, buf, bytes_read);
+				}
+			}
+			esp_codec_dev_close(playback);
+			fclose(f);
+			ESP_LOGI(TAG, "Audio file playback complete: %s", file_path.c_str());
+		}
+	}
+}
+
+static void audio_boot_task(void *arg)
+{
+	ESP_LOGI(TAG, "Playing boot sound...");
+	vTaskDelay(pdMS_TO_TICKS(500));
+
+	audio_bsp_init();
+	audio_play_init();
+
+	extern const uint8_t music_pcm_start[] asm("_binary_canon_pcm_start");
+	extern const uint8_t music_pcm_end[]   asm("_binary_canon_pcm_end");
+	size_t pcm_size = music_pcm_end - music_pcm_start;
+	uint8_t *pcm_ptr = (uint8_t *)music_pcm_start;
+	size_t written = 0;
+	while (written < pcm_size)
+	{
+		esp_codec_dev_write(get_playback_handle(), pcm_ptr + written, 256);
+		written += 256;
+	}
+	ESP_LOGI(TAG, "Boot sound complete");
+	vTaskDelete(NULL);
+}
+
 void led_test_task(void *arg)
 {
-	// Replace with the RGB LED strip functionality
-	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM); // Single RGB LED on GPIO 3
-	// Basic startup pattern to show the LED is working
-	led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
-	
+	rgb_pattern_t active_pattern = rgb_pattern_t::SOLID_COLOR;
+	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM);
+	led_strip.runPattern(active_pattern, 0, 100, 100);
+
 	int hue = 0;
 	for (;;)
 	{
-		hue = (hue + 5) % 360;
-		led_strip.runPattern(pattern_from_string(notification_instructions.message), hue, 100, 100);
+		{
+			std::lock_guard<std::mutex> lock(led_state.mutex);
+			if (led_state.active)
+			{
+				active_pattern = led_state.pattern;
+			}
+			else
+			{
+				active_pattern = rgb_pattern_t::SOLID_COLOR;
+				hue = 0;
+			}
+		}
+
+		if (active_pattern != rgb_pattern_t::SOLID_COLOR || hue != 0)
+		{
+			hue = (hue + 5) % 360;
+			led_strip.runPattern(active_pattern, hue, 100, 100);
+		}
+		else
+		{
+			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
+		}
+
 		vTaskDelay(pdMS_TO_TICKS(50));
 	}
 }
 
 void display_update_task(void *arg)
 {
-	// 1. Allocate a persistent 80,000-byte raw RGB565 canvas in external PSRAM 
-	const size_t RGB565_SIZE = 80000; 
-	static uint8_t sd_pixel_buffer[RGB565_SIZE];// = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
+	// 1. Allocate a persistent 80,000-byte raw RGB565 canvas in external PSRAM
+	const size_t RGB565_SIZE = 80000;
+	static uint8_t *sd_pixel_buffer = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
 	assert(sd_pixel_buffer != NULL);
 	memset(sd_pixel_buffer, 0xFF, RGB565_SIZE); // Default to a pure white canvas
 
 	// 2. Set up our static descriptor wrapper pointing to our unpacked canvas area
-	static lv_image_dsc_t sd_dynamic_bmp = {
-		.header = {
-			.magic = LV_IMAGE_HEADER_MAGIC,
-			.cf = LV_COLOR_FORMAT_RGB565, // Tells the engine this is basic, uncompressed RGB565 data
-			.flags = 0,
-			.w = 200,
-			.h = 200,
-			.stride = 400,                // 200 pixels * 2 bytes per pixel
-			.reserved_2 = 0,
-		},
-		.data_size = RGB565_SIZE,
-		.data = sd_pixel_buffer
-	};
+	static lv_image_dsc_t sd_dynamic_bmp;
+	sd_dynamic_bmp.header.magic = LV_IMAGE_HEADER_MAGIC;
+	sd_dynamic_bmp.header.cf = LV_COLOR_FORMAT_RGB565;
+	sd_dynamic_bmp.header.flags = 0;
+	sd_dynamic_bmp.header.w = 200;
+	sd_dynamic_bmp.header.h = 200;
+	sd_dynamic_bmp.header.stride = 400;
+	sd_dynamic_bmp.header.reserved_2 = 0;
+	sd_dynamic_bmp.data_size = RGB565_SIZE;
+	sd_dynamic_bmp.data = sd_pixel_buffer;
 
 	for (;;)
 	{
 		/* Block indefinitely until notified by the download manager task  */
 		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
 
-		if (display_instructions.active)
+		bool should_update = false;
+		std::string file_path;
 		{
-			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", display_instructions.data_path.c_str());
+			std::lock_guard<std::mutex> lock(display_state.mutex);
+			if (display_state.active)
+			{
+				should_update = true;
+				file_path = display_state.data_path;
+				display_state.active = false;
+			}
+		}
 
-			FILE *f = fopen(display_instructions.data_path.c_str(), "rb");
+		if (should_update)
+		{
+			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", file_path.c_str());
+
+			FILE *f = fopen(file_path.c_str(), "rb");
 			if (f != NULL)
 			{
 				// Step A: Skip the 12-byte LVGL header (we already know it's a 200x200 I8 file)
@@ -1056,7 +1464,7 @@ void display_update_task(void *arg)
 				fread(palette, 1, 1024, f);
 
 				// Step C: Allocate temporary scratchpad memory to read the 40,000 pixel indices
-				uint8_t *indices = (uint8_t *)malloc(40000);
+				uint8_t *indices = (uint8_t *)heap_caps_malloc(40000, MALLOC_CAP_SPIRAM);
 				if (indices != NULL)
 				{
 					fread(indices, 1, 40000, f);
@@ -1111,10 +1519,9 @@ void display_update_task(void *arg)
 			}
 			else
 			{
-				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", display_instructions.data_path.c_str());
+				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", file_path.c_str());
 			}
 
-			display_instructions.active = false; // Reset the operation flag 
 		}
 		vTaskDelay(pdMS_TO_TICKS(10));
 	}
@@ -1122,6 +1529,11 @@ void display_update_task(void *arg)
 
 extern "C" void app_main(void)
 {
+	// Derive device ID from the factory-programmed base MAC address.
+	// Must run before MQTT or any topic-dependent code.
+	device_id_init();
+	mqtt_dispatch_init();
+
 	user_app_init();
 
 	bool dynamic_factory_reset = check_reset_button_at_boot();
@@ -1220,11 +1632,13 @@ extern "C" void app_main(void)
 	ui_event_queue = xQueueCreate(10, sizeof(ui_event_type_t));
 
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
-	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 20 * 1024, NULL, 4, NULL, 1);
-	// Led Task has the lowest priority so that it doesn't interfere with the UI and display tasks
-	xTaskCreate(led_test_task, "led_test", 4096, NULL, 14, &notification_task_handle);
+	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
+	// Led Task has low priority so it doesn't interfere with the UI and display tasks
+	xTaskCreate(led_test_task, "led_test", 4096, NULL, 3, &notification_task_handle);
 	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
 	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
+	xTaskCreate(audio_playback_task, "audio_play", 8192, NULL, 4, &audio_task_handle);
+	// xTaskCreate(audio_boot_task, "audio_boot", 8192, NULL, 5, NULL);
 
 	// 1. Initialize the UI and create widgets FIRST while holding the lock
 	if (example_lvgl_lock(-1))
@@ -1243,7 +1657,7 @@ extern "C" void app_main(void)
 	// =================================================================
     // 2. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready
     // =================================================================
-    if (display_instructions.active && display_task_handle != NULL)
+    if (display_state.active && display_task_handle != NULL)
     {
         ESP_LOGI(TAG, "Boot configuration detected! Priming display loop...");
         xTaskNotifyGive(display_task_handle);

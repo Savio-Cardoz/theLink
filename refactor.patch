@@ -1,0 +1,992 @@
+From 778c6dcf4fc5868931a9a29a3a9e9d9cd425720c Mon Sep 17 00:00:00 2001
+From: Savio-Cardoz <cardoz.savio@gmail.com>
+Date: Fri, 21 Aug 2026 14:08:05 +0530
+Subject: [PATCH] Code refactor, critical design fixes
+
+---
+ components/led_strip/rgb_led_strip.h   |   2 +-
+ components/mqtt_logger/CMakeLists.txt  |   3 +
+ components/mqtt_logger/mqtt_logger.cpp | 430 +++++++++++++++++++++++++
+ components/mqtt_logger/mqtt_logger.h   |  92 ++++++
+ main/CMakeLists.txt                    |   2 +-
+ main/main.cpp                          | 241 ++++++++++++--
+ sdkconfig.defaults                     |   4 +-
+ 7 files changed, 742 insertions(+), 32 deletions(-)
+ create mode 100644 components/mqtt_logger/CMakeLists.txt
+ create mode 100644 components/mqtt_logger/mqtt_logger.cpp
+ create mode 100644 components/mqtt_logger/mqtt_logger.h
+
+diff --git a/components/led_strip/rgb_led_strip.h b/components/led_strip/rgb_led_strip.h
+index 28d951c..85345d3 100644
+--- a/components/led_strip/rgb_led_strip.h
++++ b/components/led_strip/rgb_led_strip.h
+@@ -228,7 +228,7 @@ private:
+         strip.flush();
+     }},
+     {rgb_pattern_t::RAINBOW_CYCLE, [](RgbLedStrip& strip, uint32_t h, uint32_t s, uint32_t v) {
+-        for (size_t i = 0; i < 16; ++i) {
++        for (size_t i = 0; i < size; ++i) {
+             strip.setHsvAt(i, (h + i * 360 / 16) % 360, s, v);
+         }
+         strip.flush();
+diff --git a/components/mqtt_logger/CMakeLists.txt b/components/mqtt_logger/CMakeLists.txt
+new file mode 100644
+index 0000000..a86c66a
+--- /dev/null
++++ b/components/mqtt_logger/CMakeLists.txt
+@@ -0,0 +1,3 @@
++idf_component_register(SRCS "mqtt_logger.cpp"
++                       INCLUDE_DIRS "."
++                       REQUIRES mqtt json)
+diff --git a/components/mqtt_logger/mqtt_logger.cpp b/components/mqtt_logger/mqtt_logger.cpp
+new file mode 100644
+index 0000000..2f8c313
+--- /dev/null
++++ b/components/mqtt_logger/mqtt_logger.cpp
+@@ -0,0 +1,430 @@
++/*
++ * SPDX-FileCopyrightText: 2026
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "mqtt_logger.h"
++
++#include <cstdio>
++#include <cstring>
++#include <cstdarg>
++#include <cstdlib>
++
++#include "esp_log.h"
++#include "cJSON.h"
++
++static const char *TAG = "MQTT_LOG";
++
++// ── Internal constants ───────────────────────────────────────────────
++static constexpr size_t MAX_LOG_MSG_LEN   = 256;
++static constexpr size_t MAX_TAG_LEN       = 32;
++static constexpr size_t MAX_JSON_LOG_LEN  = 512;
++static constexpr uint16_t DEFAULT_QUEUE_DEPTH = 32;
++
++// ── Internal state ───────────────────────────────────────────────────
++static esp_mqtt_client_handle_t s_client       = nullptr;
++static QueueHandle_t           s_log_queue     = nullptr;
++static TaskHandle_t            s_publish_task  = nullptr;
++static mqtt_log_level_t        s_filter_level  = MQTT_LOG_INFO;
++static char                    s_device_id[32] = {0};
++static bool                    s_initialised   = false;
++
++// Original vprintf function pointer (set by esp_log_set_vprintf).
++static int (*s_orig_vprintf)(const char *fmt, va_list args) = nullptr;
++
++// ── Queued log entry ─────────────────────────────────────────────────
++struct log_entry_t {
++    mqtt_log_level_t level;
++    char tag[MAX_TAG_LEN];
++    char message[MAX_LOG_MSG_LEN];
++};
++
++// ── Helpers ──────────────────────────────────────────────────────────
++
++static mqtt_log_level_t level_char_to_enum(char c)
++{
++    switch (c) {
++        case 'E': return MQTT_LOG_ERROR;
++        case 'W': return MQTT_LOG_WARN;
++        case 'I': return MQTT_LOG_INFO;
++        case 'D': return MQTT_LOG_DEBUG;
++        case 'V': return MQTT_LOG_VERBOSE;
++        default:  return MQTT_LOG_INFO;
++    }
++}
++
++static const char *level_to_string(mqtt_log_level_t level)
++{
++    switch (level) {
++        case MQTT_LOG_ERROR:   return "error";
++        case MQTT_LOG_WARN:    return "warn";
++        case MQTT_LOG_INFO:    return "info";
++        case MQTT_LOG_DEBUG:   return "debug";
++        case MQTT_LOG_VERBOSE: return "verbose";
++        default:               return "unknown";
++    }
++}
++
++static mqtt_log_level_t string_to_level(const char *str)
++{
++    if (strcmp(str, "error")   == 0) return MQTT_LOG_ERROR;
++    if (strcmp(str, "warn")    == 0) return MQTT_LOG_WARN;
++    if (strcmp(str, "info")    == 0) return MQTT_LOG_INFO;
++    if (strcmp(str, "debug")   == 0) return MQTT_LOG_DEBUG;
++    if (strcmp(str, "verbose") == 0) return MQTT_LOG_VERBOSE;
++    if (strcmp(str, "none")    == 0) return MQTT_LOG_NONE;
++    return MQTT_LOG_INFO; // fallback
++}
++
++/**
++ * @brief Strip ANSI escape sequences (e.g. "\033[0;31m") from the start
++ *        of a formatted log string.
++ *
++ * ESP-IDF prepends color codes when CONFIG_LOG_COLORS is enabled.
++ * Returns a pointer past any leading escape sequences.
++ */
++static const char *strip_ansi(const char *str)
++{
++    while (*str == '\033') {
++        // ESC [ <params> m
++        const char *m = strchr(str, 'm');
++        if (m) {
++            str = m + 1;
++        } else {
++            break;
++        }
++    }
++    return str;
++}
++
++/**
++ * @brief Parse an ESP-IDF formatted log line into level, tag, and message.
++ *
++ * Expected formats (after stripping ANSI):
++ *   "I (12345) tag: message"
++ *   "E (12345) tag: message"
++ *
++ * @return true if parsing succeeded.
++ */
++static bool parse_log_line(const char *raw,
++                           mqtt_log_level_t &out_level,
++                           char *out_tag, size_t tag_len,
++                           char *out_msg, size_t msg_len)
++{
++    const char *s = strip_ansi(raw);
++
++    // Level is the first character.
++    if (s[0] == '\0' || (s[1] != ' ' && s[1] != '(')) {
++        return false;
++    }
++    out_level = level_char_to_enum(s[0]);
++
++    // Skip "X " to find "(timestamp) tag: message".
++    const char *paren = strchr(s, '(');
++    if (!paren) {
++        return false;
++    }
++
++    // Find ") " which marks end of timestamp.
++    const char *close_paren = strstr(paren, ") ");
++    if (!close_paren) {
++        return false;
++    }
++
++    const char *tag_start = close_paren + 2;
++
++    // Tag ends at ": ".
++    const char *colon = strstr(tag_start, ": ");
++    if (!colon) {
++        // No tag found — treat everything as the message.
++        out_tag[0] = '\0';
++        snprintf(out_msg, msg_len, "%s", tag_start);
++        return true;
++    }
++
++    size_t tag_size = static_cast<size_t>(colon - tag_start);
++    if (tag_size >= tag_len) {
++        tag_size = tag_len - 1;
++    }
++    memcpy(out_tag, tag_start, tag_size);
++    out_tag[tag_size] = '\0';
++
++    const char *msg_start = colon + 2;
++    snprintf(out_msg, msg_len, "%s", msg_start);
++
++    return true;
++}
++
++/**
++ * @brief Build a JSON log string for MQTT publication.
++ *
++ * Output format: {"device_id":"...","level":"...","tag":"...","msg":"..."}
++ * Returns the number of bytes written (excluding null terminator), or 0 on error.
++ */
++static size_t build_log_json(char *buf, size_t buf_len,
++                             mqtt_log_level_t level,
++                             const char *tag,
++                             const char *message)
++{
++    cJSON *root = cJSON_CreateObject();
++    if (!root) {
++        return 0;
++    }
++
++    cJSON_AddStringToObject(root, "device_id", s_device_id);
++    cJSON_AddStringToObject(root, "level", level_to_string(level));
++    cJSON_AddStringToObject(root, "tag", tag);
++    cJSON_AddStringToObject(root, "msg", message);
++
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++
++    if (!json) {
++        return 0;
++    }
++
++    size_t len = strlen(json);
++    if (len >= buf_len) {
++        free(json);
++        return 0;
++    }
++
++    memcpy(buf, json, len + 1);
++    free(json);
++    return len;
++}
++
++// ── Publish task ─────────────────────────────────────────────────────
++
++static void mqtt_log_publish_task(void *arg)
++{
++    log_entry_t entry;
++
++    for (;;) {
++        if (xQueueReceive(s_log_queue, &entry, portMAX_DELAY) != pdTRUE) {
++            continue;
++        }
++
++        if (!s_client) {
++            continue;
++        }
++
++        char json_buf[MAX_JSON_LOG_LEN];
++        size_t json_len = build_log_json(json_buf, sizeof(json_buf),
++                                         entry.level, entry.tag, entry.message);
++        if (json_len == 0) {
++            continue;
++        }
++
++        // Topic: thelink/{device_id}/evt/log
++        char topic[64];
++        snprintf(topic, sizeof(topic), "thelink/%s/evt/log", s_device_id);
++
++        esp_mqtt_client_publish(s_client, topic, json_buf,
++                                static_cast<int>(json_len), 0, 0);
++    }
++}
++
++// ── esp_log hook ─────────────────────────────────────────────────────
++
++/**
++ * @brief Custom vprintf replacement installed via esp_log_set_vprintf.
++ *
++ * Intercepts formatted log output, parses level/tag/message, and queues
++ * qualifying messages for MQTT publication. Serial output is preserved
++ * by forwarding to the original vprintf.
++ */
++static int mqtt_log_vprintf(const char *fmt, va_list args)
++{
++    // Use va_copy because vs消耗 the va_list — we need two independent copies.
++    va_list args_copy;
++    va_copy(args_copy, args);
++
++    // Always forward to serial output first.
++    int ret = 0;
++    if (s_orig_vprintf) {
++        ret = s_orig_vprintf(fmt, args);
++    }
++
++    // Parse the formatted string using the copy.
++    char formatted[MAX_LOG_MSG_LEN];
++    vsnprintf(formatted, sizeof(formatted), fmt, args_copy);
++    va_end(args_copy);
++
++    mqtt_log_level_t level;
++    char tag[MAX_TAG_LEN];
++    char message[MAX_LOG_MSG_LEN];
++
++    if (!parse_log_line(formatted, level, tag, sizeof(tag),
++                        message, sizeof(message))) {
++        return ret;
++    }
++
++    // Apply filter.
++    if (level > s_filter_level || level == MQTT_LOG_NONE) {
++        return ret;
++    }
++
++    // Queue for MQTT publication (non-blocking — drop if full).
++    if (s_log_queue) {
++        log_entry_t entry;
++        entry.level = level;
++        strncpy(entry.tag, tag, sizeof(entry.tag) - 1);
++        entry.tag[sizeof(entry.tag) - 1] = '\0';
++        strncpy(entry.message, message, sizeof(entry.message) - 1);
++        entry.message[sizeof(entry.message) - 1] = '\0';
++
++        if (xQueueSend(s_log_queue, &entry, 0) != pdTRUE) {
++            // Queue full — drop silently. Could add a drop counter here.
++        }
++    }
++
++    return ret;
++}
++
++// ── Public API ───────────────────────────────────────────────────────
++
++esp_err_t mqtt_logger_init(esp_mqtt_client_handle_t client,
++                           const char *device_id,
++                           mqtt_log_level_t initial_level,
++                           uint16_t queue_depth)
++{
++    if (s_initialised) {
++        ESP_LOGW(TAG, "Already initialised");
++        return ESP_ERR_INVALID_STATE;
++    }
++
++    if (!client || !device_id) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    s_client = client;
++    strncpy(s_device_id, device_id, sizeof(s_device_id) - 1);
++    s_device_id[sizeof(s_device_id) - 1] = '\0';
++    s_filter_level = initial_level;
++
++    uint16_t depth = (queue_depth > 0) ? queue_depth : DEFAULT_QUEUE_DEPTH;
++    s_log_queue = xQueueCreate(depth, sizeof(log_entry_t));
++    if (!s_log_queue) {
++        ESP_LOGE(TAG, "Failed to create log queue");
++        return ESP_ERR_NO_MEM;
++    }
++
++    // Install the esp_log hook.  Save the original vprintf so serial
++    // output is preserved.
++    s_orig_vprintf = esp_log_set_vprintf(mqtt_log_vprintf);
++
++    // Spawn the publish task at a modest priority.
++    BaseType_t ret = xTaskCreate(mqtt_log_publish_task, "mqtt_log", 4096,
++                                 nullptr, 3, &s_publish_task);
++    if (ret != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create publish task");
++        esp_log_set_vprintf(s_orig_vprintf);
++        vQueueDelete(s_log_queue);
++        s_log_queue = nullptr;
++        return ESP_FAIL;
++    }
++
++    s_initialised = true;
++    ESP_LOGI(TAG, "MQTT logger initialised (level=%s, queue=%d)",
++             level_to_string(s_filter_level), depth);
++    return ESP_OK;
++}
++
++void mqtt_logger_deinit(void)
++{
++    if (!s_initialised) {
++        return;
++    }
++
++    // Remove the hook and restore original vprintf.
++    esp_log_set_vprintf(s_orig_vprintf);
++    s_orig_vprintf = nullptr;
++
++    // Stop the publish task.
++    if (s_publish_task) {
++        vTaskDelete(s_publish_task);
++        s_publish_task = nullptr;
++    }
++
++    // Drain and destroy the queue.
++    if (s_log_queue) {
++        vQueueDelete(s_log_queue);
++        s_log_queue = nullptr;
++    }
++
++    s_client = nullptr;
++    s_initialised = false;
++}
++
++void mqtt_logger_set_level(mqtt_log_level_t level)
++{
++    s_filter_level = level;
++    ESP_LOGI(TAG, "MQTT log level set to %s", level_to_string(level));
++}
++
++mqtt_log_level_t mqtt_logger_get_level(void)
++{
++    return s_filter_level;
++}
++
++void mqtt_logger_publish_direct(mqtt_log_level_t level,
++                                const char *tag,
++                                const char *fmt, ...)
++{
++    if (!s_client || level > s_filter_level || level == MQTT_LOG_NONE) {
++        return;
++    }
++
++    char message[MAX_LOG_MSG_LEN];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(message, sizeof(message), fmt, args);
++    va_end(args);
++
++    char json_buf[MAX_JSON_LOG_LEN];
++    size_t json_len = build_log_json(json_buf, sizeof(json_buf),
++                                     level, tag ? tag : "", message);
++    if (json_len == 0) {
++        return;
++    }
++
++    char topic[64];
++    snprintf(topic, sizeof(topic), "thelink/%s/evt/log", s_device_id);
++
++    esp_mqtt_client_publish(s_client, topic, json_buf,
++                            static_cast<int>(json_len), 0, 0);
++}
++
++void mqtt_logger_handle_command(const char *payload)
++{
++    if (!payload) {
++        return;
++    }
++
++    cJSON *json = cJSON_Parse(payload);
++    if (!json) {
++        ESP_LOGW(TAG, "Invalid JSON in log command");
++        return;
++    }
++
++    cJSON *action = cJSON_GetObjectItemCaseSensitive(json, "action");
++    if (!cJSON_IsString(action)) {
++        cJSON_Delete(json);
++        return;
++    }
++
++    if (strcmp(action->valuestring, "set_level") == 0) {
++        cJSON *level_json = cJSON_GetObjectItemCaseSensitive(json, "level");
++        if (cJSON_IsString(level_json)) {
++            mqtt_log_level_t new_level = string_to_level(level_json->valuestring);
++            mqtt_logger_set_level(new_level);
++        }
++    } else if (strcmp(action->valuestring, "get_level") == 0) {
++        // Publish current level as a status message.
++        mqtt_logger_publish_direct(MQTT_LOG_INFO, TAG,
++                                   "Current log level: %s",
++                                   level_to_string(s_filter_level));
++    }
++
++    cJSON_Delete(json);
++}
+diff --git a/components/mqtt_logger/mqtt_logger.h b/components/mqtt_logger/mqtt_logger.h
+new file mode 100644
+index 0000000..3015c26
+--- /dev/null
++++ b/components/mqtt_logger/mqtt_logger.h
+@@ -0,0 +1,92 @@
++/*
++ * SPDX-FileCopyrightText: 2026
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdarg>
++
++#include "esp_log.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "freertos/queue.h"
++#include "mqtt_client.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Log level for MQTT transport.
++ *        Matches esp_log_level_t values so they can be used interchangeably.
++ */
++typedef enum {
++    MQTT_LOG_NONE  = 0,
++    MQTT_LOG_ERROR = 1,
++    MQTT_LOG_WARN  = 2,
++    MQTT_LOG_INFO  = 3,
++    MQTT_LOG_DEBUG = 4,
++    MQTT_LOG_VERBOSE = 5,
++} mqtt_log_level_t;
++
++/**
++ * @brief Initialize the MQTT logger.
++ *
++ * Call once after the MQTT client is connected. Installs an esp_log hook
++ * that forwards log messages matching the current filter level to a FreeRTOS
++ * queue. A dedicated background task publishes queued logs over MQTT.
++ *
++ * @param client          Handle to a running esp_mqtt_client.
++ * @param device_id       Device identifier embedded in topic paths.
++ * @param initial_level   Initial log level filter (MQTT_LOG_INFO recommended).
++ * @param queue_depth     Max queued messages before oldest are dropped (0 = 32).
++ * @return                ESP_OK on success.
++ */
++esp_err_t mqtt_logger_init(esp_mqtt_client_handle_t client,
++                           const char *device_id,
++                           mqtt_log_level_t initial_level,
++                           uint16_t queue_depth);
++
++/**
++ * @brief Shut down the MQTT logger and remove the esp_log hook.
++ */
++void mqtt_logger_deinit(void);
++
++/**
++ * @brief Set the active log level filter.
++ *
++ * Only messages at this level or below are queued for MQTT publication.
++ * Serial output is unaffected.
++ */
++void mqtt_logger_set_level(mqtt_log_level_t level);
++
++/**
++ * @brief Get the current log level filter.
++ */
++mqtt_log_level_t mqtt_logger_get_level(void);
++
++/**
++ * @brief Publish a log message directly (bypasses the queue).
++ *
++ * Useful for critical messages that must not be dropped.
++ */
++void mqtt_logger_publish_direct(mqtt_log_level_t level,
++                                const char *tag,
++                                const char *fmt, ...);
++
++/**
++ * @brief Handle an incoming MQTT command to control the logger.
++ *
++ * Expected JSON payloads:
++ *   { "action": "set_level", "level": "debug" }
++ *   { "action": "get_level" }
++ *
++ * @param payload  Raw JSON payload string (null-terminated).
++ */
++void mqtt_logger_handle_command(const char *payload);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index d977ba3..e45920d 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1,4 +1,4 @@
+ idf_component_register(SRCS "data_downloader.cpp" "main.cpp" "wifi.c" "wifi_no.c"
+                     INCLUDE_DIRS "./"
+-                    REQUIRES led_strip sdcard_manager esp_http_client user_app nvs_flash mqtt json
++                    REQUIRES led_strip sdcard_manager esp_http_client user_app nvs_flash mqtt json mqtt_logger
+ )
+diff --git a/main/main.cpp b/main/main.cpp
+index 52315c5..b9077b3 100644
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -34,12 +34,55 @@
+ #include "driver/gpio.h"  // Ensure this header is included
+ 
+ #include "rgb_led_strip.h"
++#include "mqtt_logger.h"
++#include "esp_mac.h"
++
++#include <mutex>
++#include <cstring>
+ 
+ #define RESET_BUTTON_GPIO   GPIO_NUM_18  // Standard BOOT button on ESP32 Dev Kits
+ #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
+ 
+ #define RMT_LED_STRIP_GPIO_NUM gpio_num_t(3)
+ 
++// Device ID and MQTT topics are derived from WiFi MAC at runtime.
++// Populated by device_id_init() early in app_main.
++#define DEVICE_ID_MAX_LEN      32
++#define MQTT_TOPIC_MAX_LEN     64
++
++static char s_device_id[DEVICE_ID_MAX_LEN];
++static char s_mqtt_cmd_topic_base[MQTT_TOPIC_MAX_LEN];
++static char s_mqtt_evt_topic_base[MQTT_TOPIC_MAX_LEN];
++static char s_mqtt_cmd_log_topic[MQTT_TOPIC_MAX_LEN];
++
++/**
++ * @brief Read the base MAC address and build the device ID and MQTT topics.
++ *
++ * Uses esp_efuse_mac_get_default() so this can run before WiFi init.
++ * Format: "thelink-XXYYZZ" where XX, YY, ZZ are the last 3 bytes of the MAC.
++ * Topics follow: "thelink/<device_id>/cmd/log", etc.
++ */
++static void device_id_init(void)
++{
++    uint8_t mac[6];
++    esp_efuse_mac_get_default(mac);
++
++    // Device ID: "thelink-XXYYZZ"
++    snprintf(s_device_id, sizeof(s_device_id), "thelink-%02X%02X%02X",
++             mac[3], mac[4], mac[5]);
++
++    // Topic paths
++    snprintf(s_mqtt_cmd_topic_base, sizeof(s_mqtt_cmd_topic_base),
++             "thelink/%s/cmd/", s_device_id);
++    snprintf(s_mqtt_evt_topic_base, sizeof(s_mqtt_evt_topic_base),
++             "thelink/%s/evt/", s_device_id);
++    snprintf(s_mqtt_cmd_log_topic, sizeof(s_mqtt_cmd_log_topic),
++             "thelink/%s/cmd/log", s_device_id);
++
++    ESP_LOGI("DEVICE", "Device ID: %s", s_device_id);
++    ESP_LOGI("DEVICE", "Log cmd topic: %s", s_mqtt_cmd_log_topic);
++}
++
+ // 2. Global Widget Pointers
+ lv_obj_t *wifi_status_icon = NULL; // Overlay widget container
+ lv_obj_t *prov_qr_code_widget = NULL; // Handle for provisioning QR code screen
+@@ -111,20 +154,63 @@ typedef struct instructions_struct
+ 	bool active;
+ 	std::string data_path;
+ 	uint32_t run_interval;
+-	bool repeat;
+-	std::string message;
++	bool repeat;			// TODO: Unused as yet, not sure why this is needed
++	std::string message;	// TODO: Phase out message eventually. Use messageData instead
++	char *messageData;	
+ } instructions_t;
+ 
++// ── Per-subsystem typed state structs ────────────────────────────────
++
++struct display_state_t {
++	bool active;
++	std::mutex mutex;
++	std::string data_path;
++	uint32_t cmd_id;
++};
++
++struct led_state_t {
++	bool active;
++	std::mutex mutex;
++	rgb_pattern_t pattern;
++	char pattern_name[32];
++	uint8_t hue;
++	uint8_t saturation;
++	uint8_t value;
++	uint32_t cmd_id;
++};
++
++struct audio_state_t {
++	bool active;
++	std::mutex mutex;
++	char filename[64];
++	uint8_t volume;
++	uint32_t cmd_id;
++};
++
++display_state_t display_state;
++led_state_t led_state;
++audio_state_t audio_state;
++
++// Backward-compatible aliases for legacy code paths not yet migrated
++char rgb_led_pattern_message[32] = {0};
+ instructions_t display_instructions;
+ instructions_t rgb_instructions;
+ instructions_t audio_instructions;
+ instructions_t notification_instructions;
+ 
++std::mutex notification_mutex;
++
+ TaskHandle_t display_task_handle = NULL;
+ TaskHandle_t rgb_task_handle = NULL;
+ TaskHandle_t audio_task_handle = NULL;
+ TaskHandle_t notification_task_handle = NULL;
+ 
++// Forward declarations for notification getter/setters
++bool get_notification_state();
++void set_notification_state(bool state);
++void set_notification_message(const std::string &message);
++std::string get_notification_message();
++
+ // Global Handle for the Queue
+ static QueueHandle_t download_cmd_queue = NULL;
+ 
+@@ -178,10 +264,13 @@ void save_settings_to_json(void)
+     cJSON *root = cJSON_CreateObject();
+     
+     // Add display path string
+-    cJSON_AddStringToObject(root, "display", display_instructions.data_path.c_str());
++    {
++        std::lock_guard<std::mutex> lock(display_state.mutex);
++        cJSON_AddStringToObject(root, "display", display_state.data_path.c_str());
++    }
+     
+     // Add LED pattern state status string
+-    cJSON_AddStringToObject(root, "led", notification_instructions.active ? "active" : "inactive");
++    cJSON_AddStringToObject(root, "led", get_notification_state() ? "active" : "inactive");
+ 
+     char *json_str = cJSON_Print(root);
+     if (json_str != NULL)
+@@ -230,16 +319,18 @@ void load_settings_from_json(void)
+             cJSON *display_item = cJSON_GetObjectItemCaseSensitive(json, "display");
+             if (cJSON_IsString(display_item) && (display_item->valuestring != NULL))
+             {
+-                display_instructions.data_path = std::string(display_item->valuestring);
+-                display_instructions.active = true; // Flag for boot processing
+-                ESP_LOGI("CONFIG", "Restored display state path: %s", display_instructions.data_path.c_str());
++                display_state.data_path = std::string(display_item->valuestring);
++                display_state.active = true;
++                display_instructions.data_path = display_state.data_path;
++                display_instructions.active = true;
++                ESP_LOGI("CONFIG", "Restored display state path: %s", display_state.data_path.c_str());
+             }
+ 
+             // Parse and apply LED notification parameters
+             cJSON *led_item = cJSON_GetObjectItemCaseSensitive(json, "led");
+             if (cJSON_IsString(led_item) && (led_item->valuestring != NULL))
+             {
+-                notification_instructions.active = (strcmp(led_item->valuestring, "active") == 0);
++				set_notification_state(strcmp(led_item->valuestring, "active") == 0);
+                 ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
+             }
+ 
+@@ -452,8 +543,13 @@ static void download_orchestrator_task(void *arg)
+ 				if (success)
+ 				{
+ 					ESP_LOGI(TAG, "Download completed successfully: %s", filepath.c_str());
+-					display_instructions.data_path = filepath; // Update the display instructions with the new file path
+-					display_instructions.active = true; // Signal the display task to show the new image
++					{
++						std::lock_guard<std::mutex> lock(display_state.mutex);
++						display_state.data_path = filepath;
++						display_state.active = true;
++					}
++					display_instructions.data_path = filepath;
++					display_instructions.active = true;
+ 
+ 					save_settings_to_json();
+ 					// Note: In a real application, you might want to use a more robust method
+@@ -657,7 +753,12 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
+ 	case MQTT_EVENT_CONNECTED:
+ 		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+ 		msg_id = esp_mqtt_client_subscribe(client, CONFIG_COMMAND_TOPIC, 2);
+-		ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
++		ESP_LOGI(TAG, "sent subscribe to %s, msg_id=%d", CONFIG_COMMAND_TOPIC, msg_id);
++
++		// Initialise MQTT logger and subscribe to log-level commands
++		mqtt_logger_init(client, s_device_id, MQTT_LOG_INFO, 32);
++		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_log_topic, 1);
++		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_log_topic, msg_id);
+ 		break;
+ 	case MQTT_EVENT_DISCONNECTED:
+ 		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+@@ -688,6 +789,18 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
+ 		memcpy(payload, event->data, event->data_len);
+ 		payload[event->data_len] = '\0';
+ 
++		// ── Topic-based dispatch ──────────────────────────────────────
++
++		// Log command topic
++		if (event->topic_len == strlen(s_mqtt_cmd_log_topic) &&
++		 strncmp(event->topic, s_mqtt_cmd_log_topic, event->topic_len) == 0)
++		{
++			mqtt_logger_handle_command(payload);
++			free(payload);
++			break;
++		}
++
++		// Legacy command topic — parse JSON and dispatch by type field
+ 		/* Parse JSON and pass to be processed based on command */
+ 		cJSON *json = cJSON_Parse(payload);
+ 		if (json == NULL)
+@@ -725,7 +838,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
+ 			DownloadCommand_t cmd;
+ 			memset(&cmd, 0, sizeof(DownloadCommand_t));
+ 			strncpy(cmd.url, path_item->valuestring, MAX_URL_LEN - 1);
+-			strncpy(cmd.filename, filename_item->valuestring, MAX_FILE_LEN - 1); // Example filename, adjust as needed
++			strncpy(cmd.filename, filename_item->valuestring, MAX_FILE_LEN - 1);
+ 
+ 			if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS)
+ 			{
+@@ -739,13 +852,18 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
+ 
+ 		cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
+ 
+-		// Print 'type' and 'message' fields for debugging
+ 		ESP_LOGI(TAG, "Command type: %s", cJSON_IsString(type) ? type->valuestring : "N/A");
+ 		ESP_LOGI(TAG, "Command message: %s", (message_item && cJSON_IsString(message_item)) ? message_item->valuestring : "N/A");
+ 
+ 		if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0)
+ 		{
+ 			ESP_LOGI(TAG, "Received display download command");
++			{
++				std::lock_guard<std::mutex> lock(display_state.mutex);
++				display_state.active = true;
++				display_state.data_path = "/sdcard/" + std::string(filename_item->valuestring);
++			}
++			// Keep legacy path in sync
+ 			display_instructions.active = true;
+ 			display_instructions.data_path = "/sdcard/" + std::string(filename_item->valuestring);
+ 		}
+@@ -762,8 +880,8 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
+ 			if(message_item != NULL && cJSON_IsString(message_item) && message_item->valuestring != NULL)
+ 			{
+ 				ESP_LOGI(TAG, "Notification message: %s", message_item->valuestring);
+-				notification_instructions.message = std::string(message_item->valuestring);
+-				notification_instructions.active = true;
++				set_notification_message(std::string(message_item->valuestring));
++				set_notification_state(true);
+ 			}
+ 			else
+ 			{
+@@ -997,18 +1115,64 @@ const wifi_prov_event_handler_t wifi_prov_event_handler = {
+ };
+ #endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
+ 
++bool get_notification_state()
++{
++	std::lock_guard<std::mutex> lock(led_state.mutex);
++	return led_state.active;
++}
++
++void set_notification_state(bool state)
++{
++	std::lock_guard<std::mutex> lock(led_state.mutex);
++	led_state.active = state;
++}
++
++void set_notification_message(const std::string &message)
++{
++	std::lock_guard<std::mutex> lock(led_state.mutex);
++	strncpy(led_state.pattern_name, message.c_str(), sizeof(led_state.pattern_name) - 1);
++	led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
++	led_state.pattern = pattern_from_string(message);
++}
++
++std::string get_notification_message()
++{
++	std::lock_guard<std::mutex> lock(led_state.mutex);
++	return std::string(led_state.pattern_name);
++}
++
+ void led_test_task(void *arg)
+ {
+-	// Replace with the RGB LED strip functionality
+-	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM); // Single RGB LED on GPIO 3
+-	// Basic startup pattern to show the LED is working
+-	led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
+-	
++	rgb_pattern_t active_pattern = rgb_pattern_t::SOLID_COLOR;
++	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM);
++	led_strip.runPattern(active_pattern, 0, 100, 100);
++
+ 	int hue = 0;
+ 	for (;;)
+ 	{
+-		hue = (hue + 5) % 360;
+-		led_strip.runPattern(pattern_from_string(notification_instructions.message), hue, 100, 100);
++		{
++			std::lock_guard<std::mutex> lock(led_state.mutex);
++			if (led_state.active)
++			{
++				active_pattern = led_state.pattern;
++			}
++			else
++			{
++				active_pattern = rgb_pattern_t::SOLID_COLOR;
++				hue = 0;
++			}
++		}
++
++		if (active_pattern != rgb_pattern_t::SOLID_COLOR || hue != 0)
++		{
++			hue = (hue + 5) % 360;
++			led_strip.runPattern(active_pattern, hue, 100, 100);
++		}
++		else
++		{
++			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, 0, 100, 100);
++		}
++
+ 		vTaskDelay(pdMS_TO_TICKS(50));
+ 	}
+ }
+@@ -1041,11 +1205,27 @@ void display_update_task(void *arg)
+ 		/* Block indefinitely until notified by the download manager task  */
+ 		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+ 
+-		if (display_instructions.active)
++		bool should_update = false;
++		std::string file_path;
++		{
++			std::lock_guard<std::mutex> lock(display_state.mutex);
++			if (display_state.active)
++			{
++				should_update = true;
++				file_path = display_state.data_path;
++				display_state.active = false;
++			}
++		}
++		// Keep legacy path in sync
++		if (should_update) {
++			display_instructions.active = false;
++		}
++
++		if (should_update)
+ 		{
+-			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", display_instructions.data_path.c_str());
++			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", file_path.c_str());
+ 
+-			FILE *f = fopen(display_instructions.data_path.c_str(), "rb");
++			FILE *f = fopen(file_path.c_str(), "rb");
+ 			if (f != NULL)
+ 			{
+ 				// Step A: Skip the 12-byte LVGL header (we already know it's a 200x200 I8 file)
+@@ -1111,10 +1291,9 @@ void display_update_task(void *arg)
+ 			}
+ 			else
+ 			{
+-				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", display_instructions.data_path.c_str());
++				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", file_path.c_str());
+ 			}
+ 
+-			display_instructions.active = false; // Reset the operation flag 
+ 		}
+ 		vTaskDelay(pdMS_TO_TICKS(10));
+ 	}
+@@ -1122,6 +1301,10 @@ void display_update_task(void *arg)
+ 
+ extern "C" void app_main(void)
+ {
++	// Derive device ID from the factory-programmed base MAC address.
++	// Must run before MQTT or any topic-dependent code.
++	device_id_init();
++
+ 	user_app_init();
+ 
+ 	bool dynamic_factory_reset = check_reset_button_at_boot();
+@@ -1221,8 +1404,8 @@ extern "C" void app_main(void)
+ 
+ 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
+ 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 20 * 1024, NULL, 4, NULL, 1);
+-	// Led Task has the lowest priority so that it doesn't interfere with the UI and display tasks
+-	xTaskCreate(led_test_task, "led_test", 4096, NULL, 14, &notification_task_handle);
++	// Led Task has low priority so it doesn't interfere with the UI and display tasks
++	xTaskCreate(led_test_task, "led_test", 4096, NULL, 3, &notification_task_handle);
+ 	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
+ 	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
+ 
+diff --git a/sdkconfig.defaults b/sdkconfig.defaults
+index f99d238..a238ef3 100644
+--- a/sdkconfig.defaults
++++ b/sdkconfig.defaults
+@@ -16,4 +16,6 @@ CONFIG_SPIRAM_SPEED_80M=y
+ CONFIG_FATFS_LFN_HEAP=y
+ CONFIG_LV_CONF_MINIMAL=y
+ CONFIG_LV_BUILD_EXAMPLES=n
+-CONFIG_LV_BUILD_DEMOS=n
+\ No newline at end of file
++CONFIG_LV_BUILD_DEMOS=n
++CONFIG_LV_USE_IMAGE=y
++CONFIG_LV_USE_IMAGEBUTTON=y
+\ No newline at end of file
+-- 
+2.43.0
+
