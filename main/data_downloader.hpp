@@ -26,6 +26,7 @@ private:
     TaskHandle_t httpTaskHandle = nullptr;
 
     std::atomic<bool> isDownloadActive{false};
+    std::atomic<bool> isDownloadError{false};
     std::string currentFilename;
     std::string currentUrl;
 

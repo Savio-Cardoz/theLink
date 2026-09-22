@@ -1,0 +1,8 @@
+# Development build profile defaults.
+# Overlaid on top of sdkconfig.defaults via SDKCONFIG_DEFAULTS (see scripts/build.py).
+# Uses a standard partition table without OTA (partitions_dev.csv). The app is
+# flashed to the factory partition with a plain `idf.py flash`; the
+# esp32_factory_app bootloader is NOT used during development.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_dev.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_dev.csv"

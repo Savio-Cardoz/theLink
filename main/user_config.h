@@ -21,7 +21,7 @@
 #define VBAT_PWR_PIN GPIO_NUM_17
 
 #define BOOT_BUTTON_PIN GPIO_NUM_0
-#define PWR_BUTTON_PIN GPIO_NUM_18
+#define PWR_BUTTON_PIN GPIO_NUM_3
 
 /*Low-power wake-up*/
 #define ext_wakeup_pin_1 GPIO_NUM_0
@@ -43,5 +43,7 @@
 #define SDMMC_D0_PIN GPIO_NUM_40
 #define SDMMC_CLK_PIN GPIO_NUM_39
 #define SDMMC_CMD_PIN GPIO_NUM_41
+
+#define RGB_LED_STRIP_PIN 2
 
 #endif // !USER_CONFIG_H

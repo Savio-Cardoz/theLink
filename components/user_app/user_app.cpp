@@ -35,10 +35,20 @@ void user_app_init(void)
     driver_config.spi_host = EPD_SPI_NUM;
     driver_config.buffer_len = 5000;
     driver = new epaper_driver_display(EPD_WIDTH, EPD_HEIGHT, driver_config);
+}
+
+static void epd_display_init_task(void *arg)
+{
+    ESP_LOGI("EPD", "e-paper init task started (background)");
     driver->EPD_Init();
     driver->EPD_Clear();
-    // driver->EPD_DisplayPartBaseImage();
-    // driver->EPD_Init_Partial(); // 局部刷新初始化
+    ESP_LOGI("EPD", "e-paper ready");
+    vTaskDelete(NULL);
+}
+
+void user_app_display_init(void)
+{
+    xTaskCreate(epd_display_init_task, "epd_init", 4096, NULL, 5, NULL);
 }
 
 void loop_lvgl_img(void *arg)

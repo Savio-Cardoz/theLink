@@ -16,6 +16,7 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <nvs_flash.h>
+#include <nvs.h>
 #include <network_provisioning/manager.h>
 #include <network_provisioning/scheme_ble.h>
 #include "qrcode.h"
@@ -42,13 +43,17 @@
 #include "audio_bsp.h"
 #include "codec_init.h"
 
+#include "esp_system.h"
+#include "esp_partition.h"
+#include "esp_ota_ops.h"
+
 #include <mutex>
 #include <cstring>
 
-#define RESET_BUTTON_GPIO   GPIO_NUM_18  // Standard BOOT button on ESP32 Dev Kits
+#define RESET_BUTTON_GPIO   GPIO_NUM_3  // Factory-reset / re-provision button (moved from GPIO18)
 #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
 
-#define RMT_LED_STRIP_GPIO_NUM gpio_num_t(3)
+#define RMT_LED_STRIP_GPIO_NUM gpio_num_t(RGB_LED_STRIP_PIN) // GPIO pin for the RGB LED strip
 
 // Device ID and MQTT topics are derived from WiFi MAC at runtime.
 // Populated by device_id_init() early in app_main.
@@ -63,6 +68,8 @@ static char s_mqtt_cmd_display_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_rgb_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_audio_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_notification_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_ota_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_ota_topic[MQTT_TOPIC_MAX_LEN];
 
 static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
 
@@ -97,6 +104,10 @@ static void device_id_init(void)
              "thelink/%s/cmd/audio", s_device_id);
     snprintf(s_mqtt_cmd_notification_topic, sizeof(s_mqtt_cmd_notification_topic),
              "thelink/%s/cmd/notification", s_device_id);
+    snprintf(s_mqtt_cmd_ota_topic, sizeof(s_mqtt_cmd_ota_topic),
+             "thelink/%s/cmd/ota", s_device_id);
+    snprintf(s_mqtt_evt_ota_topic, sizeof(s_mqtt_evt_ota_topic),
+             "thelink/%s/evt/ota", s_device_id);
 
     ESP_LOGI("DEVICE", "Device ID: %s", s_device_id);
     ESP_LOGI("DEVICE", "Log cmd topic: %s", s_mqtt_cmd_log_topic);
@@ -104,6 +115,8 @@ static void device_id_init(void)
     ESP_LOGI("DEVICE", "RGB cmd topic: %s", s_mqtt_cmd_rgb_topic);
     ESP_LOGI("DEVICE", "Audio cmd topic: %s", s_mqtt_cmd_audio_topic);
     ESP_LOGI("DEVICE", "Notification cmd topic: %s", s_mqtt_cmd_notification_topic);
+    ESP_LOGI("DEVICE", "OTA cmd topic: %s", s_mqtt_cmd_ota_topic);
+    ESP_LOGI("DEVICE", "OTA evt topic: %s", s_mqtt_evt_ota_topic);
 }
 
 // 2. Global Widget Pointers
@@ -168,7 +181,8 @@ static QueueHandle_t ui_event_queue = NULL;
 // Download target routing
 typedef enum {
 	DOWNLOAD_TARGET_DISPLAY,
-	DOWNLOAD_TARGET_AUDIO
+	DOWNLOAD_TARGET_AUDIO,
+	DOWNLOAD_TARGET_FIRMWARE
 } download_target_t;
 
 // The structure passed through the FreeRTOS Queue
@@ -540,6 +554,314 @@ static EventGroupHandle_t wifi_event_group;
 
 /* Event handler for catching system events */
 
+// ── Firmware update (OTA) helpers ───────────────────────────────────
+
+static void publish_ota_event(const char *status, const char *detail)
+{
+	if (s_mqtt_client == nullptr)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_CreateObject();
+	if (root == nullptr)
+	{
+		return;
+	}
+	cJSON_AddStringToObject(root, "status", status);
+	if (detail != nullptr)
+	{
+		cJSON_AddStringToObject(root, "detail", detail);
+	}
+
+	char *payload = cJSON_Print(root);
+	if (payload != nullptr)
+	{
+		esp_mqtt_client_publish(s_mqtt_client, s_mqtt_evt_ota_topic, payload, 0, 1, 0);
+		free(payload);
+	}
+	cJSON_Delete(root);
+}
+
+// ── OTA intent handshake (shared NVS namespace with esp32_factory_app) ──
+//
+// The factory (bootloader) app must NEVER flash /sdcard/update.bin on its
+// own: it only flashes when this state says UPDATE_REQUESTED. The same
+// namespace is used to pass the outcome of an update cycle back to this app.
+
+#define OTA_NVS_NAMESPACE "ota"
+
+typedef enum {
+	OTA_STATE_NONE = 0,             // No cycle in progress
+	OTA_STATE_UPDATE_REQUESTED = 1, // App asked factory to flash update.bin
+	OTA_STATE_UPDATE_IN_PROGRESS = 2, // Factory is flashing
+	OTA_STATE_UPDATE_DONE = 3,      // Factory flashed new app successfully
+	OTA_STATE_UPDATE_FAILED = 4,    // Factory refused / aborted
+	OTA_STATE_UPDATE_RESTORED = 5,  // Backup restored after failed test
+} ota_state_t;
+
+typedef enum {
+	OTA_REASON_NONE = 0,
+	OTA_REASON_BAD_FILE = 1,
+	OTA_REASON_FLASH_FAILED = 2,
+	OTA_REASON_BACKUP_FAILED = 3,
+	OTA_REASON_NO_BACKUP = 4,
+} ota_fail_reason_t;
+
+static esp_err_t ota_nvs_state_set(uint8_t state, uint8_t reason)
+{
+	nvs_handle_t h;
+	esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &h);
+	if (err != ESP_OK)
+	{
+		return err;
+	}
+	err = nvs_set_u8(h, "state", state);
+	if (err == ESP_OK)
+	{
+		err = nvs_set_u8(h, "reason", reason);
+	}
+	if (err == ESP_OK)
+	{
+		err = nvs_commit(h);
+	}
+	nvs_close(h);
+	return err;
+}
+
+static esp_err_t ota_nvs_state_get(uint8_t *state, uint8_t *reason)
+{
+	*state = OTA_STATE_NONE;
+	*reason = OTA_REASON_NONE;
+
+	nvs_handle_t h;
+	esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &h);
+	if (err == ESP_ERR_NVS_NOT_FOUND)
+	{
+		return ESP_OK;
+	}
+	if (err != ESP_OK)
+	{
+		return err;
+	}
+	if (nvs_get_u8(h, "state", state) == ESP_OK)
+	{
+		/* read ok */
+	}
+	if (nvs_get_u8(h, "reason", reason) == ESP_OK)
+	{
+		/* read ok */
+	}
+	nvs_close(h);
+	return ESP_OK;
+}
+
+// Publish the pending OTA outcome (DONE / RESTORED / FAILED) once MQTT is up,
+// then clear the handshake back to NONE. Returns true if an event was sent.
+static bool ota_publish_pending_event(void)
+{
+	uint8_t state = OTA_STATE_NONE;
+	uint8_t reason = OTA_REASON_NONE;
+	ota_nvs_state_get(&state, &reason);
+
+	if (state == OTA_STATE_NONE)
+	{
+		return false;
+	}
+
+	const char *status = nullptr;
+	const char *detail = nullptr;
+	switch (state)
+	{
+	case OTA_STATE_UPDATE_DONE:
+		status = "update_success";
+		detail = "new firmware validated";
+		break;
+	case OTA_STATE_UPDATE_RESTORED:
+		status = "update_restored";
+		detail = "previous firmware restored after failed test";
+		break;
+	case OTA_STATE_UPDATE_FAILED:
+		status = "failed";
+		switch (reason)
+		{
+		case OTA_REASON_BAD_FILE: detail = "invalid update.bin"; break;
+		case OTA_REASON_FLASH_FAILED: detail = "flash failed"; break;
+		case OTA_REASON_BACKUP_FAILED: detail = "backup failed"; break;
+		case OTA_REASON_NO_BACKUP: detail = "no backup available"; break;
+		default: detail = "update failed"; break;
+		}
+		break;
+	case OTA_STATE_UPDATE_REQUESTED:
+	case OTA_STATE_UPDATE_IN_PROGRESS:
+	default:
+		status = "failed";
+		detail = "update aborted before completion";
+		break;
+	}
+
+	ota_nvs_state_set(OTA_STATE_NONE, OTA_REASON_NONE);
+	publish_ota_event(status, detail);
+	return true;
+}
+
+// Boot-time handling of the OTA handshake. Runs right after NVS init.
+//  - Marks the running app VALID on the first boot after an update (this is
+//    the "under test" confirmation: without it the bootloader reverts).
+//  - Clears stale REQUESTED / IN_PROGRESS states so a stale update.bin can
+//    never be flashed later.
+// Outcome events (DONE / RESTORED / FAILED) are deferred to MQTT connect so
+// they are not lost when the network is still down at boot.
+static void ota_handle_boot_state(void)
+{
+	// Only relevant when an otadata partition exists (Prod layout).
+	if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr) == nullptr)
+	{
+		return; // Dev build: no OTA, nothing to do.
+	}
+
+	uint8_t state = OTA_STATE_NONE;
+	uint8_t reason = OTA_REASON_NONE;
+	ota_nvs_state_get(&state, &reason);
+
+	const esp_partition_t *running_part = esp_ota_get_running_partition();
+	if (running_part != nullptr &&
+		running_part->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN &&
+		running_part->subtype <= ESP_PARTITION_SUBTYPE_APP_OTA_MAX)
+	{
+		esp_ota_img_states_t running_state = ESP_OTA_IMG_UNDEFINED;
+		if (esp_ota_get_state_partition(running_part, &running_state) == ESP_OK &&
+			running_state == ESP_OTA_IMG_PENDING_VERIFY)
+		{
+			ESP_LOGI(TAG, "OTA first boot detected (PENDING_VERIFY) - confirming app is valid.");
+			esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+			if (err != ESP_OK)
+			{
+				ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed (%s)", esp_err_to_name(err));
+			}
+		}
+	}
+
+	// A request that never reached the factory app must not linger: a later
+	// boot into factory could otherwise flash a stale update.bin.
+	if (state == OTA_STATE_UPDATE_REQUESTED || state == OTA_STATE_UPDATE_IN_PROGRESS)
+	{
+		ESP_LOGW(TAG, "OTA state %d was never completed by the factory app - clearing.", state);
+		ota_nvs_state_set(OTA_STATE_NONE, OTA_REASON_NONE);
+	}
+}
+
+static void show_update_in_progress(void)
+{
+	ESP_LOGI(TAG, "Showing 'Update in progress' on display");
+
+	if (example_lvgl_lock(-1))
+	{
+		lv_obj_t *scr = lv_screen_active();
+		lv_obj_clean(scr);
+
+		lv_obj_t *lbl = lv_label_create(scr);
+		lv_label_set_text(lbl, "Update in\nprogress");
+		lv_obj_set_style_text_font(lbl, LV_FONT_DEFAULT, 0);
+		lv_obj_center(lbl);
+
+		lv_obj_invalidate(scr);
+		lv_refr_now(lv_display_get_default());
+
+		example_lvgl_unlock();
+	}
+
+	// Give the e-paper time to finish the full refresh before rebooting.
+	vTaskDelay(pdMS_TO_TICKS(4000));
+}
+
+static void handle_firmware_update(const std::string &filepath)
+{
+	ESP_LOGI(TAG, "Firmware update download complete: %s", filepath.c_str());
+
+	// Locate the partition the bootloader app will flash (ota_0).
+	const esp_partition_t *ota0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+	if (ota0 == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: ota_0 partition not found!");
+		publish_ota_event("failed", "ota_0 partition missing");
+		return;
+	}
+
+	// Quick sanity check before committing to the update.
+	FILE *f = fopen(filepath.c_str(), "rb");
+	if (f == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: cannot open %s", filepath.c_str());
+		publish_ota_event("failed", "cannot open update file");
+		return;
+	}
+	fseek(f, 0, SEEK_END);
+	long file_size = ftell(f);
+	fclose(f);
+
+	if (file_size <= 0 || (size_t)file_size > ota0->size)
+	{
+		ESP_LOGE(TAG, "Firmware update: bad file size %ld (ota_0 max %u)", file_size, (unsigned)ota0->size);
+		publish_ota_event("failed", "bad update file size");
+		return;
+	}
+
+	// ESP-IDF app images start with the magic byte 0xE9.
+	f = fopen(filepath.c_str(), "rb");
+	if (f != nullptr)
+	{
+		uint8_t magic = 0;
+		if (fread(&magic, 1, 1, f) != 1 || magic != 0xE9)
+		{
+			ESP_LOGE(TAG, "Firmware update: not a valid ESP-IDF app image (magic 0x%02X)", magic);
+			fclose(f);
+			publish_ota_event("failed", "invalid firmware image");
+			return;
+		}
+		fclose(f);
+	}
+
+	ESP_LOGI(TAG, "Firmware update validated (%ld bytes). Showing update screen.", file_size);
+	publish_ota_event("downloaded", filepath.c_str());
+
+	show_update_in_progress();
+
+	// Point the ROM bootloader at the factory (bootloader) app.
+	const esp_partition_t *bootloader_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+	if (bootloader_part == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: factory partition not found!");
+		publish_ota_event("failed", "factory partition missing");
+		return;
+	}
+
+	// Record the update intent in NVS so the factory app flashes ONLY when an
+	// update was actually requested (never a stale /sdcard/update.bin).
+	esp_err_t nvs_err = ota_nvs_state_set(OTA_STATE_UPDATE_REQUESTED, OTA_REASON_NONE);
+	if (nvs_err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "Firmware update: failed to record update intent (%s)", esp_err_to_name(nvs_err));
+		publish_ota_event("failed", "cannot record update intent");
+		return;
+	}
+
+	esp_err_t err = esp_ota_set_boot_partition(bootloader_part);
+	if (err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "Firmware update: esp_ota_set_boot_partition failed (%s)", esp_err_to_name(err));
+		publish_ota_event("failed", esp_err_to_name(err));
+		return;
+	}
+
+	ESP_LOGI(TAG, "Firmware update: boot partition set to factory. Rebooting into bootloader.");
+	mqtt_logger_publish_direct(MQTT_LOG_INFO, TAG, "Firmware update ready. Rebooting into bootloader.");
+	publish_ota_event("rebooting", "bootloader");
+
+	vTaskDelay(pdMS_TO_TICKS(500));
+	esp_restart();
+}
+
 static void notify_download_handler(download_target_t target, bool success, const std::string &filepath)
 {
 	if (!success)
@@ -583,6 +905,10 @@ static void notify_download_handler(download_target_t target, bool success, cons
 			ESP_LOGI(TAG, "Notifying audio task of new file: %s", audio_state.filename);
 			xTaskNotifyGive(audio_task_handle);
 		}
+	}
+	else if (target == DOWNLOAD_TARGET_FIRMWARE)
+	{
+		handle_firmware_update(filepath);
 	}
 }
 
@@ -796,6 +1122,7 @@ static void handle_display_command(const char *payload);
 static void handle_rgb_command(const char *payload);
 static void handle_audio_command(const char *payload);
 static void handle_notification_command(const char *payload);
+static void handle_ota_command(const char *payload);
 
 static std::map<std::string, std::function<void(const char *)>> s_cmd_dispatch;
 
@@ -806,6 +1133,7 @@ static void mqtt_dispatch_init(void)
 	s_cmd_dispatch[s_mqtt_cmd_rgb_topic] = handle_rgb_command;
 	s_cmd_dispatch[s_mqtt_cmd_audio_topic] = handle_audio_command;
 	s_cmd_dispatch[s_mqtt_cmd_notification_topic] = handle_notification_command;
+	s_cmd_dispatch[s_mqtt_cmd_ota_topic] = handle_ota_command;
 }
 
 /*
@@ -843,6 +1171,8 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_notification_topic, msg_id);
 		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_log_topic, 1);
 		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_log_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_ota_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_ota_topic, msg_id);
 
 		// Legacy topic for backward compatibility
 		msg_id = esp_mqtt_client_subscribe(client, CONFIG_COMMAND_TOPIC, 2);
@@ -850,6 +1180,9 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 
 		// Initialise MQTT logger
 		mqtt_logger_init(client, s_device_id, MQTT_LOG_INFO, 16);
+
+		// Report any OTA cycle that completed while the network was down.
+		ota_publish_pending_event();
 		break;
 	case MQTT_EVENT_DISCONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -1303,6 +1636,51 @@ static void handle_notification_command(const char *payload)
 	cJSON_Delete(json);
 }
 
+static void handle_ota_command(const char *payload)
+{
+	ESP_LOGI(TAG, "OTA command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "OTA: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *version = cJSON_GetObjectItemCaseSensitive(json, "version");
+
+	if (!cJSON_IsString(download) || download->valuestring == NULL) {
+		ESP_LOGW(TAG, "OTA command missing valid 'download' URL");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "OTA firmware: %s (version=%s)",
+			 download->valuestring,
+			 (cJSON_IsString(version) && version->valuestring != NULL) ? version->valuestring : "?");
+
+	publish_ota_event("started", download->valuestring);
+
+	// Reuse the bootloader app's fixed filename on the SD card.
+	if (sdcard != nullptr && sdcard->isMounted() && sdcard->fileExists("update.bin"))
+	{
+		sdcard->deleteFile("update.bin");
+	}
+
+	DownloadCommand_t cmd;
+	memset(&cmd, 0, sizeof(DownloadCommand_t));
+	strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+	strncpy(cmd.filename, "update.bin", sizeof(cmd.filename) - 1);
+	cmd.target = DOWNLOAD_TARGET_FIRMWARE;
+
+	if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+		ESP_LOGE(TAG, "OTA: download queue full, dropping command");
+		publish_ota_event("failed", "queue full");
+	}
+
+	cJSON_Delete(json);
+}
+
 // ── Audio playback task ───────────────────────────────────────────
 
 static void audio_playback_task(void *arg)
@@ -1570,6 +1948,7 @@ extern "C" void app_main(void)
 	mqtt_dispatch_init();
 
 	user_app_init();
+	user_app_display_init();
 
 	bool dynamic_factory_reset = check_reset_button_at_boot();
 
@@ -1640,6 +2019,9 @@ extern "C" void app_main(void)
 		/* Retry nvs_flash_init */
 		ESP_ERROR_CHECK(nvs_flash_init());
 	}
+
+	/* Handle OTA cycle results from the factory app (mark VALID, clear stale intents) */
+	ota_handle_boot_state();
 
 	/* Initialize TCP/IP */
 	ESP_ERROR_CHECK(esp_netif_init());

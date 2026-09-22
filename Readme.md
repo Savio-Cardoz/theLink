@@ -1,4 +1,6 @@
 
+![TheLink](docs/v2.jpg)
+
 ## TheLink ESP32-S3
 
 MQTT-controlled embedded device driving an e-paper display, RGB LED strip, and audio output.
@@ -10,12 +12,79 @@ MQTT-controlled embedded device driving an e-paper display, RGB LED strip, and a
 - MQTT v5 broker (default: `mqtt://broker.emqx.io`)
 - SD card (FAT32) mounted at `/sdcard`
 
+### Setup the ESP-IDF environment
+
+The IDF tools live in `$env:IDF_PATH`, which must point at the ESP-IDF install
+that actually has its toolchain installed (e.g.
+`C:\Espressif\frameworks\esp-idf-v5.4.1` for the Espressif installer layout, or
+`/opt/esp/idf` inside the devcontainer). Tools and toolchains are *not* tied to
+a bare `git clone` of ESP-IDF — running the export script from such a clone
+fails with `tool ... has no installed versions`.
+
+In a new PowerShell terminal, set `IDF_PATH` and load the environment, then go
+to the project:
+
+```powershell
+# Point at your installed ESP-IDF, then export its tools onto PATH
+$env:IDF_PATH = "C:\Espressif\frameworks\esp-idf-v5.4.1"
+& "$env:IDF_PATH\export.ps1"
+
+cd E:\Savio\Embedded\ESP\TheLink
+```
+
+Notes:
+- The export must be repeated in every new terminal (environment variables are
+  per-session). To avoid it, set `IDF_PATH` permanently (System → Advanced
+  system settings → Environment Variables → user variable `IDF_PATH`) or use the
+  **"ESP-IDF PowerShell"** shortcut from the Start menu, which exports the
+  correct environment automatically.
+- A stale `IDF_PATH` (e.g. from a user/machine env var pointing at an older
+  clone) overrides the new value inside already-open terminals. Restart the
+  terminal after changing it, or set it in-session as above.
+- `scripts/build.py` and `scripts/flash_all.py` auto-locate the ESP-IDF Python
+  environment, so they work without the export. The export is still required to
+  call `idf.py`, `esptool.py`, or `menuconfig` directly.
+
 ### Build & Flash
 
+A single switch selects the build profile (`scripts/build.py`). **Dev is the
+default**: `sdkconfig.defaults` points at `partitions_dev.csv`, so a plain
+`python3 scripts/build.py` (or bare `idf.py build`) gives a development build.
+
+- **Dev** (default) — standard partition table **without OTA**
+  (`partitions_dev.csv`). The app is flashed straight to the `factory`
+  partition with a plain `idf.py flash`; the `esp32_factory_app` bootloader is
+  **not** used. Builds go to `build-dev`.
+- **Prod** — production partition table for OTA via the `esp32_factory_app`
+  bootloader (`partitions.csv`: `factory` + `ota_0`). Builds go to `build`.
+
+The IDF Python tools are launched with the `python3` interpreter.
+
 ```bash
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+# Development build (no OTA) — default profile
+python3 scripts/build.py
+python3 scripts/build.py flash
+
+# Production build (esp32_factory_app OTA)
+python3 scripts/build.py -p Prod
+python3 scripts/build.py -p Prod flash
 ```
+
+Manual equivalents:
+
+```bash
+# Dev (default): standard single-app partition table, no OTA
+python3 $IDF_PATH/tools/idf.py -B build-dev build
+python3 $IDF_PATH/tools/idf.py -B build-dev flash
+
+# Prod: OTA table (factory = esp32_factory_app, ota_0 = main app)
+python3 $IDF_PATH/tools/idf.py -B build -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.prod" build
+```
+
+For production, the firmware is flashed to the `ota_0` partition; the
+`factory` partition holds the bootloader app (`esp32_factory_app`). Flash both
+apps (and the shared bootloader/partition table) with
+`python3 scripts/flash_all.py`.
 
 ---
 
@@ -29,7 +98,9 @@ All topics are per-device, derived from the last 3 bytes of the factory MAC addr
 | `thelink/{device_id}/cmd/rgb` | Subscribe | 1 | Send RGB LED pattern commands |
 | `thelink/{device_id}/cmd/audio` | Subscribe | 1 | Send audio playback commands |
 | `thelink/{device_id}/cmd/notification` | Subscribe | 1 | Send LED notification commands |
+| `thelink/{device_id}/cmd/ota` | Subscribe | 1 | Trigger firmware update download |
 | `thelink/{device_id}/cmd/log` | Subscribe | 1 | Send logger control commands |
+| `thelink/{device_id}/evt/ota` | Publish | 1 | Firmware update status events |
 | `thelink/{device_id}/evt/log` | Publish | 0 | Device log output (JSON) |
 | `company/command` | Subscribe | 2 | Legacy topic (backward compatible) |
 
@@ -111,6 +182,27 @@ Activates an LED pattern as a notification alert.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `message` | string | Yes | Pattern name (same values as RGB `pattern` field) |
+
+### Firmware Update (`thelink/{device_id}/cmd/ota`)
+
+Downloads a firmware image to the SD card, prints "Update in progress" on the
+e-paper, and reboots into the bootloader app (`factory` partition), which
+flashes the image from `/sdcard/update.bin` into `ota_0`.
+
+```json
+{
+  "download": "https://example.com/theLink_esp32s3.bin",
+  "version": "0.4.0"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `download` | string | Yes | HTTP(S) URL of the ESP-IDF app image (.bin) |
+| `version` | string | No | New firmware version (logged, informational) |
+
+Update progress is published to `thelink/{device_id}/evt/ota` as JSON with
+a `status` of `started`, `downloaded`, `rebooting`, or `failed`.
 
 ### Log Control (`thelink/{device_id}/cmd/log`)
 

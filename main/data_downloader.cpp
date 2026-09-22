@@ -61,7 +61,7 @@ void AsyncDownloader::runStorageTask()
 
     if (onCompleteCallback)
     {
-        onCompleteCallback(downloadSuccess, currentFilename);
+        onCompleteCallback(downloadSuccess && !isDownloadError, currentFilename);
     }
 
     storageTaskHandle = nullptr;
@@ -102,6 +102,7 @@ void AsyncDownloader::runHttpTask()
     {
         ESP_LOGE(TAG, "HTTP Task: Failed to open connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        isDownloadError = true;
         isDownloadActive = false;
         vTaskDelete(NULL);
         return;
@@ -110,6 +111,20 @@ void AsyncDownloader::runHttpTask()
     // 3. Fetch headers to get the file size
     int content_length = esp_http_client_fetch_headers(client);
     ESP_LOGI(TAG, "HTTP Task: Fetched headers. Content length: %d", content_length);
+
+    int status_code = esp_http_client_get_status_code(client);
+    if (status_code != 200)
+    {
+        ESP_LOGE(TAG, "HTTP Task: Server returned status %d. Aborting download.", status_code);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        isDownloadError = true;
+        isDownloadActive = false;
+        httpTaskHandle = nullptr;
+        vTaskDelete(NULL);
+        return;
+    }
+
     if (content_length <= 0)
     {
         ESP_LOGW(TAG, "HTTP Task: Server didn't provide content length. Streaming until EOF.");
@@ -130,11 +145,12 @@ void AsyncDownloader::runHttpTask()
         }
 
         int bytesRead = esp_http_client_read(client, (char *)txBuffer, CHUNK_SIZE);
-        ESP_LOGI(TAG, "HTTP Task: Read %d bytes", bytesRead);
+        ESP_LOGD(TAG, "HTTP Task: Read %d bytes", bytesRead);
 
         if (bytesRead < 0)
         {
             ESP_LOGE(TAG, "HTTP Task: Read error!");
+            isDownloadError = true;
             break;
         }
         else if (bytesRead == 0)
@@ -153,10 +169,18 @@ void AsyncDownloader::runHttpTask()
         if (bytesSent != bytesRead)
         {
             ESP_LOGE(TAG, "HTTP Task: Stream buffer full! Storage task is frozen.");
+            isDownloadError = true;
             break;
         }
 
         totalBytesDownloaded += bytesRead;
+    }
+
+    if (content_length > 0 && totalBytesDownloaded != content_length)
+    {
+        ESP_LOGE(TAG, "HTTP Task: Size mismatch! Got %d bytes, expected %d.",
+                 totalBytesDownloaded, content_length);
+        isDownloadError = true;
     }
 
     // 5. Clean up HTTP resources
@@ -207,6 +231,7 @@ bool AsyncDownloader::startDownload(const std::string &url, const std::string &f
     currentFilename = filename;
     onCompleteCallback = callback;
     isDownloadActive = true;
+    isDownloadError = false;
 
     xStreamBufferReset(streamBuffer);
 

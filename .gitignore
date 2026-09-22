@@ -18,10 +18,12 @@
 
 # Build artifacts and directories
 **/build/
+**/build-dev/
 
 # Configuration files with sensitive information
 **/Server/config.json
 build/
+build-dev/
 *.o
 *.a
 *.out
