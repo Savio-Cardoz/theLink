@@ -1378,6 +1378,7 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
         lv_image_set_src(qr_image_obj, NULL); 
         lv_image_set_src(qr_image_obj, &qr_dynamic_bmp);
         lv_obj_center(qr_image_obj);
+        lv_obj_move_foreground(qr_image_obj);
         lv_obj_clear_flag(qr_image_obj, LV_OBJ_FLAG_HIDDEN);
         lv_obj_invalidate(qr_image_obj);
         
@@ -2048,16 +2049,10 @@ extern "C" void app_main(void)
 
 	ui_event_queue = xQueueCreate(10, sizeof(ui_event_type_t));
 
-	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
-	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
-	// Led Task has low priority so it doesn't interfere with the UI and display tasks
-	xTaskCreate(led_test_task, "led_test", 4096, NULL, 3, &notification_task_handle);
-	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
-	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
-	xTaskCreate(audio_playback_task, "audio_play", 8192, NULL, 4, &audio_task_handle);
-	// xTaskCreate(audio_boot_task, "audio_boot", 8192, NULL, 5, NULL);
-
-	// 1. Initialize the UI and create widgets FIRST while holding the lock
+	// 1. Initialize the UI and create widgets FIRST while holding the lock.
+	//    MUST run before the provisioning task spawns: user_ui_init() calls
+	//    lv_obj_clean(lv_screen_active()), which would delete the QR widget
+	//    pushed by wifi_prov_task if the ordering were reversed.
 	if (example_lvgl_lock(-1))
 	{
 		user_ui_init(); // <--- Instantiates 'dynamic_epd_image' safely!
@@ -2070,6 +2065,15 @@ extern "C" void app_main(void)
 
 		example_lvgl_unlock();
 	}
+
+	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
+	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
+	// Led Task has low priority so it doesn't interfere with the UI and display tasks
+	xTaskCreate(led_test_task, "led_test", 4096, NULL, 3, &notification_task_handle);
+	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
+	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
+	xTaskCreate(audio_playback_task, "audio_play", 8192, NULL, 4, &audio_task_handle);
+	// xTaskCreate(audio_boot_task, "audio_boot", 8192, NULL, 5, NULL);
 
 	// =================================================================
     // 2. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready
