@@ -49,6 +49,10 @@
 
 #include <mutex>
 #include <cstring>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
 
 #define RESET_BUTTON_GPIO   GPIO_NUM_3  // Factory-reset / re-provision button (moved from GPIO18)
 #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
@@ -69,6 +73,7 @@ static char s_mqtt_cmd_rgb_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_audio_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_notification_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_ota_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_led_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_ota_topic[MQTT_TOPIC_MAX_LEN];
 
 static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
@@ -106,6 +111,8 @@ static void device_id_init(void)
              "thelink/%s/cmd/notification", s_device_id);
     snprintf(s_mqtt_cmd_ota_topic, sizeof(s_mqtt_cmd_ota_topic),
              "thelink/%s/cmd/ota", s_device_id);
+    snprintf(s_mqtt_evt_led_topic, sizeof(s_mqtt_evt_led_topic),
+             "thelink/%s/evt/led", s_device_id);
     snprintf(s_mqtt_evt_ota_topic, sizeof(s_mqtt_evt_ota_topic),
              "thelink/%s/evt/ota", s_device_id);
 
@@ -116,6 +123,7 @@ static void device_id_init(void)
     ESP_LOGI("DEVICE", "Audio cmd topic: %s", s_mqtt_cmd_audio_topic);
     ESP_LOGI("DEVICE", "Notification cmd topic: %s", s_mqtt_cmd_notification_topic);
     ESP_LOGI("DEVICE", "OTA cmd topic: %s", s_mqtt_cmd_ota_topic);
+    ESP_LOGI("DEVICE", "LED evt topic: %s", s_mqtt_evt_led_topic);
     ESP_LOGI("DEVICE", "OTA evt topic: %s", s_mqtt_evt_ota_topic);
 }
 
@@ -202,16 +210,27 @@ struct display_state_t {
 	uint32_t cmd_id;
 };
 
+// Number of pixels on the RGB LED ring.
+static constexpr size_t LED_COUNT = 16;
+
 struct led_state_t {
 	bool active;
 	std::mutex mutex;
 	rgb_pattern_t pattern;
 	char pattern_name[32];
-	uint8_t hue;
-	uint8_t saturation;
-	uint8_t value;
+	uint16_t hue;             // base hue [0, 359]
+	uint8_t saturation;       // [0, 100]
+	uint8_t value;            // [0, 100]
+	uint8_t brightness;       // global brightness scale [0, 100]
+	uint32_t speed_ms;        // animation frame period [5, 5000] ms
+	uint32_t duration_ms;     // auto-off deadline span; 0 = no auto-off
+	uint64_t set_at_ms;       // esp_timer epoch (ms) when colour state was set
+	bool has_pixels;          // per-pixel overrides active
+	std::array<int32_t, LED_COUNT> pixels; // -1 = skip, else 0xRRGGBB
 	uint32_t cmd_id;
 };
+
+static uint32_t s_led_cmd_seq = 0;
 
 struct audio_state_t {
 	bool active;
@@ -224,6 +243,24 @@ struct audio_state_t {
 display_state_t display_state;
 led_state_t led_state;
 audio_state_t audio_state;
+
+static void led_state_init_defaults(void)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	led_state.active = false;
+	led_state.pattern = rgb_pattern_t::SOLID_COLOR;
+	led_state.pattern_name[0] = '\0';
+	led_state.hue = 0;
+	led_state.saturation = 100;
+	led_state.value = 100;
+	led_state.brightness = 100;
+	led_state.speed_ms = 20;
+	led_state.duration_ms = 0;
+	led_state.set_at_ms = 0;
+	led_state.has_pixels = false;
+	led_state.pixels.fill(-1);
+	led_state.cmd_id = 0;
+}
 
 std::mutex notification_mutex;
 
@@ -296,6 +333,182 @@ static const char sec2_verifier[] = {
 
 #endif
 
+// ── LED colour helpers ──────────────────────────────────────────────
+
+static const char *pattern_to_string(rgb_pattern_t pattern)
+{
+	switch (pattern)
+	{
+	case rgb_pattern_t::OFF: return "off";
+	case rgb_pattern_t::SOLID_COLOR: return "solid_color";
+	case rgb_pattern_t::RAINBOW_CYCLE: return "rainbow_cycle";
+	case rgb_pattern_t::THEATER_CHASE: return "theater_chase";
+	case rgb_pattern_t::COLOR_WIPE: return "color_wipe";
+	case rgb_pattern_t::SCANNER: return "scanner";
+	case rgb_pattern_t::FADE: return "fade";
+	}
+	return "solid_color";
+}
+
+static uint32_t clamp_u(long long value, long long lo, long long hi)
+{
+	if (value < lo) value = lo;
+	if (value > hi) value = hi;
+	return static_cast<uint32_t>(value);
+}
+
+static bool hex_to_rgb(const char *str, uint8_t &r, uint8_t &g, uint8_t &b)
+{
+	if (str == nullptr)
+	{
+		return false;
+	}
+	const char *p = str;
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p == '#') p++;
+
+	size_t len = 0;
+	while (p[len] != '\0' && p[len] != ' ' && p[len] != '\t') len++;
+	if (len != 6)
+	{
+		return false;
+	}
+
+	char *endptr = nullptr;
+	unsigned long val = strtoul(p, &endptr, 16);
+	if (endptr == p || *endptr != '\0')
+	{
+		return false;
+	}
+	r = static_cast<uint8_t>((val >> 16) & 0xFF);
+	g = static_cast<uint8_t>((val >> 8) & 0xFF);
+	b = static_cast<uint8_t>(val & 0xFF);
+	return true;
+}
+
+// Parsed colour: valid flag + both HSV (uniform internal form) and RGB.
+struct led_color_t {
+	bool valid = false;
+	uint32_t h = 0;
+	uint32_t s = 0;
+	uint32_t v = 0;
+	uint8_t r = 0;
+	uint8_t g = 0;
+	uint8_t b = 0;
+};
+
+// Accepts "#RRGGBB" (or "RRGGBB"), {h,s,v} (h 0-360, s/v 0-100), or {r,g,b}.
+static led_color_t parse_led_color(cJSON *item)
+{
+	if (cJSON_IsString(item) && item->valuestring != NULL)
+	{
+		uint8_t r, g, b;
+		if (hex_to_rgb(item->valuestring, r, g, b))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.r = r; out.g = g; out.b = b;
+			RgbLedStrip<LED_COUNT>::rgb2hsv(r, g, b, out.h, out.s, out.v);
+			return out;
+		}
+		return {};
+	}
+
+	if (cJSON_IsObject(item))
+	{
+		cJSON *h = cJSON_GetObjectItemCaseSensitive(item, "h");
+		cJSON *s = cJSON_GetObjectItemCaseSensitive(item, "s");
+		cJSON *v = cJSON_GetObjectItemCaseSensitive(item, "v");
+		if (cJSON_IsNumber(h) && cJSON_IsNumber(s) && cJSON_IsNumber(v))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.h = clamp_u(h->valueint, 0, 359);
+			out.s = clamp_u(s->valueint, 0, 100);
+			out.v = clamp_u(v->valueint, 0, 100);
+			RgbLedStrip<LED_COUNT>::hsv2rgb(out.h, out.s, out.v, out.r, out.g, out.b);
+			return out;
+		}
+
+		cJSON *r = cJSON_GetObjectItemCaseSensitive(item, "r");
+		cJSON *g = cJSON_GetObjectItemCaseSensitive(item, "g");
+		cJSON *b = cJSON_GetObjectItemCaseSensitive(item, "b");
+		if (cJSON_IsNumber(r) && cJSON_IsNumber(g) && cJSON_IsNumber(b))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.r = static_cast<uint8_t>(clamp_u(r->valueint, 0, 255));
+			out.g = static_cast<uint8_t>(clamp_u(g->valueint, 0, 255));
+			out.b = static_cast<uint8_t>(clamp_u(b->valueint, 0, 255));
+			RgbLedStrip<LED_COUNT>::rgb2hsv(out.r, out.g, out.b, out.h, out.s, out.v);
+			return out;
+		}
+	}
+
+	return {};
+}
+
+// Publish the canonical LED state to thelink/{id}/evt/led (retained) as an
+// acknowledgement so brokers/integrators always have the authoritative state.
+static void publish_led_event(void)
+{
+	if (s_mqtt_client == nullptr)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_CreateObject();
+	if (root == nullptr)
+	{
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(led_state.mutex);
+
+		cJSON_AddBoolToObject(root, "active", led_state.active);
+		cJSON_AddStringToObject(root, "pattern", pattern_to_string(led_state.pattern));
+
+		cJSON *color = cJSON_CreateObject();
+		cJSON_AddNumberToObject(color, "h", led_state.hue);
+		cJSON_AddNumberToObject(color, "s", led_state.saturation);
+		cJSON_AddNumberToObject(color, "v", led_state.value);
+		cJSON_AddItemToObject(root, "color", color);
+
+		cJSON_AddNumberToObject(root, "brightness", led_state.brightness);
+		cJSON_AddNumberToObject(root, "speed", led_state.speed_ms);
+		cJSON_AddNumberToObject(root, "cmd_id", led_state.cmd_id);
+
+		if (led_state.has_pixels)
+		{
+			cJSON *pixels = cJSON_CreateArray();
+			for (size_t i = 0; i < LED_COUNT; i++)
+			{
+				int32_t px = led_state.pixels[i];
+				if (px < 0)
+				{
+					cJSON_AddItemToArray(pixels, cJSON_CreateNull());
+				}
+				else
+				{
+					char hex[10];
+					snprintf(hex, sizeof(hex), "#%06X", (unsigned)px);
+					cJSON_AddItemToArray(pixels, cJSON_CreateString(hex));
+				}
+			}
+			cJSON_AddItemToObject(root, "pixels", pixels);
+		}
+	}
+
+	char *payload = cJSON_Print(root);
+	if (payload != nullptr)
+	{
+		esp_mqtt_client_publish(s_mqtt_client, s_mqtt_evt_led_topic, payload, 0, 1, 1);
+		free(payload);
+	}
+	cJSON_Delete(root);
+}
+
 void save_settings_to_json(void)
 {
     // Create the root JSON object structure
@@ -307,8 +520,45 @@ void save_settings_to_json(void)
         cJSON_AddStringToObject(root, "display", display_state.data_path.c_str());
     }
     
-    // Add LED pattern state status string
-    cJSON_AddStringToObject(root, "led", get_notification_state() ? "active" : "inactive");
+    // Add LED pattern state as a structured object
+    {
+        std::lock_guard<std::mutex> lock(led_state.mutex);
+
+        cJSON *led = cJSON_CreateObject();
+        cJSON_AddBoolToObject(led, "active", led_state.active);
+        cJSON_AddStringToObject(led, "pattern", pattern_to_string(led_state.pattern));
+
+        cJSON *color = cJSON_CreateObject();
+        cJSON_AddNumberToObject(color, "h", led_state.hue);
+        cJSON_AddNumberToObject(color, "s", led_state.saturation);
+        cJSON_AddNumberToObject(color, "v", led_state.value);
+        cJSON_AddItemToObject(led, "color", color);
+
+        cJSON_AddNumberToObject(led, "brightness", led_state.brightness);
+        cJSON_AddNumberToObject(led, "speed", led_state.speed_ms);
+
+        if (led_state.has_pixels)
+        {
+            cJSON *pixels = cJSON_CreateArray();
+            for (size_t i = 0; i < LED_COUNT; i++)
+            {
+                int32_t px = led_state.pixels[i];
+                if (px < 0)
+                {
+                    cJSON_AddItemToArray(pixels, cJSON_CreateNull());
+                }
+                else
+                {
+                    char hex[10];
+                    snprintf(hex, sizeof(hex), "#%06X", (unsigned)px);
+                    cJSON_AddItemToArray(pixels, cJSON_CreateString(hex));
+                }
+            }
+            cJSON_AddItemToObject(led, "pixels", pixels);
+        }
+
+        cJSON_AddItemToObject(root, "led", led);
+    }
 
     char *json_str = cJSON_Print(root);
     if (json_str != NULL)
@@ -364,10 +614,82 @@ void load_settings_from_json(void)
 
             // Parse and apply LED notification parameters
             cJSON *led_item = cJSON_GetObjectItemCaseSensitive(json, "led");
-            if (cJSON_IsString(led_item) && (led_item->valuestring != NULL))
+            if (led_item != nullptr)
             {
-				set_notification_state(strcmp(led_item->valuestring, "active") == 0);
-                ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
+                if (cJSON_IsString(led_item) && led_item->valuestring != NULL)
+                {
+                    // Legacy format: "active" / "inactive"
+                    set_notification_state(strcmp(led_item->valuestring, "active") == 0);
+                    ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
+                }
+                else if (cJSON_IsObject(led_item))
+                {
+                    std::lock_guard<std::mutex> lock(led_state.mutex);
+
+                    cJSON *a = cJSON_GetObjectItemCaseSensitive(led_item, "active");
+                    if (cJSON_IsBool(a))
+                    {
+                        led_state.active = cJSON_IsTrue(a);
+                    }
+
+                    cJSON *p = cJSON_GetObjectItemCaseSensitive(led_item, "pattern");
+                    if (cJSON_IsString(p) && p->valuestring != NULL)
+                    {
+                        led_state.pattern = pattern_from_string(p->valuestring);
+                        strncpy(led_state.pattern_name, p->valuestring, sizeof(led_state.pattern_name) - 1);
+                        led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+                    }
+
+                    cJSON *c = cJSON_GetObjectItemCaseSensitive(led_item, "color");
+                    if (c != nullptr && !cJSON_IsNull(c))
+                    {
+                        led_color_t col = parse_led_color(c);
+                        if (col.valid)
+                        {
+                            led_state.hue = static_cast<uint16_t>(col.h);
+                            led_state.saturation = static_cast<uint8_t>(col.s);
+                            led_state.value = static_cast<uint8_t>(col.v);
+                        }
+                    }
+
+                    cJSON *b = cJSON_GetObjectItemCaseSensitive(led_item, "brightness");
+                    if (cJSON_IsNumber(b))
+                    {
+                        led_state.brightness = static_cast<uint8_t>(clamp_u(b->valueint, 0, 100));
+                    }
+
+                    cJSON *sp = cJSON_GetObjectItemCaseSensitive(led_item, "speed");
+                    if (cJSON_IsNumber(sp))
+                    {
+                        led_state.speed_ms = clamp_u(sp->valueint, 5, 5000);
+                    }
+
+                    cJSON *pix = cJSON_GetObjectItemCaseSensitive(led_item, "pixels");
+                    if (cJSON_IsArray(pix))
+                    {
+                        led_state.pixels.fill(-1);
+                        int wrote = 0;
+                        int n = cJSON_GetArraySize(pix);
+                        for (int i = 0; i < n && i < (int)LED_COUNT; i++)
+                        {
+                            cJSON *entry = cJSON_GetArrayItem(pix, i);
+                            if (cJSON_IsNull(entry))
+                            {
+                                continue;
+                            }
+                            led_color_t col = parse_led_color(entry);
+                            if (col.valid)
+                            {
+                                led_state.pixels[i] = ((int32_t)col.r << 16) | ((int32_t)col.g << 8) | (int32_t)col.b;
+                                wrote++;
+                            }
+                        }
+                        led_state.has_pixels = (wrote > 0);
+                    }
+
+                    ESP_LOGI("CONFIG", "Restored notification LED state object (active=%d, pattern=%s)",
+                             led_state.active, pattern_to_string(led_state.pattern));
+                }
             }
 
             cJSON_Delete(json);
@@ -1183,6 +1505,9 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 
 		// Report any OTA cycle that completed while the network was down.
 		ota_publish_pending_event();
+
+		// Publish the canonical LED state (retained) for broker/integrator sync.
+		publish_led_event();
 		break;
 	case MQTT_EVENT_DISCONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -1534,30 +1859,130 @@ static void handle_rgb_command(const char *payload)
 		return;
 	}
 
-	cJSON *pattern = cJSON_GetObjectItemCaseSensitive(json, "pattern");
-	cJSON *enable = cJSON_GetObjectItemCaseSensitive(json, "enable");
-	bool has_pattern = cJSON_IsString(pattern) && pattern->valuestring != NULL;
-	bool has_enable = cJSON_IsBool(enable);
+	bool has_any = false;
+	bool persist = true;
 
-	if (!has_pattern && !has_enable) {
-		ESP_LOGW(TAG, "RGB command missing valid 'pattern' or 'enable' field");
+	cJSON *enable = cJSON_GetObjectItemCaseSensitive(json, "enable");
+	cJSON *pattern = cJSON_GetObjectItemCaseSensitive(json, "pattern");
+	cJSON *color = cJSON_GetObjectItemCaseSensitive(json, "color");
+	cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
+	cJSON *speed = cJSON_GetObjectItemCaseSensitive(json, "speed");
+	cJSON *duration = cJSON_GetObjectItemCaseSensitive(json, "duration");
+	cJSON *pixels = cJSON_GetObjectItemCaseSensitive(json, "pixels");
+	cJSON *persist_item = cJSON_GetObjectItemCaseSensitive(json, "persist");
+
+	if (cJSON_IsBool(persist_item))
+	{
+		persist = cJSON_IsTrue(persist_item);
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(led_state.mutex);
+
+		if (cJSON_IsBool(enable))
+		{
+			led_state.active = cJSON_IsTrue(enable);
+			has_any = true;
+		}
+
+		if (cJSON_IsString(pattern) && pattern->valuestring != NULL)
+		{
+			led_state.pattern = pattern_from_string(pattern->valuestring);
+			strncpy(led_state.pattern_name, pattern->valuestring, sizeof(led_state.pattern_name) - 1);
+			led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+			has_any = true;
+			if (!cJSON_IsBool(enable))
+			{
+				led_state.active = true;
+			}
+		}
+
+		if (color != nullptr && !cJSON_IsNull(color))
+		{
+			led_color_t c = parse_led_color(color);
+			if (c.valid)
+			{
+				led_state.hue = static_cast<uint16_t>(c.h);
+				led_state.saturation = static_cast<uint8_t>(c.s);
+				led_state.value = static_cast<uint8_t>(c.v);
+				has_any = true;
+			}
+			else
+			{
+				ESP_LOGW(TAG, "RGB: invalid 'color' value");
+			}
+		}
+
+		if (cJSON_IsNumber(brightness))
+		{
+			led_state.brightness = static_cast<uint8_t>(clamp_u(brightness->valueint, 0, 100));
+			has_any = true;
+		}
+
+		if (cJSON_IsNumber(speed))
+		{
+			led_state.speed_ms = clamp_u(speed->valueint, 5, 5000);
+			has_any = true;
+		}
+
+		if (cJSON_IsNumber(duration))
+		{
+			if (duration->valueint <= 0)
+			{
+				led_state.duration_ms = 0;
+			}
+			else
+			{
+				led_state.duration_ms = clamp_u(duration->valueint, 1, 3600) * 1000U;
+			}
+			led_state.set_at_ms = esp_timer_get_time() / 1000;
+			has_any = true;
+		}
+
+		if (cJSON_IsArray(pixels))
+		{
+			int n = cJSON_GetArraySize(pixels);
+			if (n > 0)
+			{
+				led_state.pixels.fill(-1);
+				int wrote = 0;
+				for (int i = 0; i < n && i < (int)LED_COUNT; i++)
+				{
+					cJSON *entry = cJSON_GetArrayItem(pixels, i);
+					if (cJSON_IsNull(entry))
+					{
+						continue;
+					}
+					led_color_t c = parse_led_color(entry);
+					if (c.valid)
+					{
+						led_state.pixels[i] = ((int32_t)c.r << 16) | ((int32_t)c.g << 8) | (int32_t)c.b;
+						wrote++;
+					}
+				}
+				led_state.has_pixels = (wrote > 0);
+				has_any = true;
+			}
+		}
+
+		if (has_any)
+		{
+			led_state.cmd_id = ++s_led_cmd_seq;
+		}
+	}
+
+	if (!has_any)
+	{
+		ESP_LOGW(TAG, "RGB command missing valid fields");
 		cJSON_Delete(json);
 		return;
 	}
 
-	if (has_enable) {
-		bool enabled = cJSON_IsTrue(enable);
-		ESP_LOGI(TAG, "RGB lights: %s", enabled ? "ON" : "OFF");
-		set_notification_state(enabled);
+	if (persist)
+	{
+		save_settings_to_json();
 	}
-
-	if (has_pattern) {
-		ESP_LOGI(TAG, "RGB pattern: %s", pattern->valuestring);
-		set_notification_message(std::string(pattern->valuestring));
-		if (!has_enable) {
-			set_notification_state(true);
-		}
-	}
+	publish_led_event();
 
 	cJSON_Delete(json);
 }
@@ -1788,41 +2213,95 @@ static void audio_boot_task(void *arg)
 
 void led_test_task(void *arg)
 {
-	rgb_pattern_t active_pattern = rgb_pattern_t::SOLID_COLOR;
-	RgbLedStrip<16> led_strip(RMT_LED_STRIP_GPIO_NUM);
-	led_strip.runPattern(active_pattern, 0, 100, 100);
+	RgbLedStrip<LED_COUNT> led_strip(RMT_LED_STRIP_GPIO_NUM);
+	uint32_t phase = 0;
+	uint64_t last_frame_ms = esp_timer_get_time() / 1000;
 
-	int hue = 0;
-	int saturation = 100;
-	int value = 100;
 	for (;;)
 	{
+		const uint64_t now_ms = esp_timer_get_time() / 1000;
+
+		// Auto-off once the configured duration has elapsed.
+		bool expired = false;
 		{
 			std::lock_guard<std::mutex> lock(led_state.mutex);
-			if (led_state.active)
+			if (led_state.active && led_state.duration_ms > 0 &&
+				now_ms >= led_state.set_at_ms + led_state.duration_ms)
 			{
-				active_pattern = led_state.pattern;
-			}
-			else
-			{
-				active_pattern = rgb_pattern_t::SOLID_COLOR;
-				hue = 0;
-				saturation = 0;
-				value = 0;
+				led_state.active = false;
+				expired = true;
 			}
 		}
-
-		if (active_pattern != rgb_pattern_t::SOLID_COLOR || hue != 0)
+		if (expired)
 		{
-			hue = (hue + 5) % 360;
-			led_strip.runPattern(active_pattern, hue, 100, 100);
+			ESP_LOGI(TAG, "LED auto-off after duration");
+			publish_led_event();
+		}
+
+		bool active;
+		rgb_pattern_t pattern;
+		uint16_t hue;
+		uint8_t saturation, value, brightness;
+		bool has_pixels;
+		std::array<int32_t, LED_COUNT> pixels;
+		uint32_t speed_ms;
+		{
+			std::lock_guard<std::mutex> lock(led_state.mutex);
+			active = led_state.active;
+			pattern = led_state.pattern;
+			hue = led_state.hue;
+			saturation = led_state.saturation;
+			value = led_state.value;
+			brightness = led_state.brightness;
+			has_pixels = led_state.has_pixels;
+			pixels = led_state.pixels;
+			speed_ms = led_state.speed_ms;
+		}
+
+		led_strip.setBrightness(brightness);
+
+		if (!active || pattern == rgb_pattern_t::OFF)
+		{
+			led_strip.clear();
+			phase = 0;
+			last_frame_ms = now_ms;
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		if (has_pixels)
+		{
+			// Per-pixel overrides ignore the pattern generator.
+			led_strip.setAllRgb(0, 0, 0);
+			for (size_t i = 0; i < LED_COUNT; i++)
+			{
+				int32_t px = pixels[i];
+				if (px < 0)
+				{
+					continue;
+				}
+				led_strip.setPixelRgb(i, (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF);
+			}
+			led_strip.flush();
+		}
+		else if (pattern == rgb_pattern_t::SOLID_COLOR)
+		{
+			// Hold the exact requested colour (no animation).
+			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, hue, saturation, value);
+			last_frame_ms = now_ms;
 		}
 		else
 		{
-			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, hue, saturation, value);
+			// Animate by advancing the hue/phase offset at the configured speed.
+			if (now_ms - last_frame_ms >= speed_ms)
+			{
+				phase = (phase + 5) % 360;
+				last_frame_ms = now_ms;
+			}
+			led_strip.runPattern(pattern, phase, saturation, value);
 		}
 
-		vTaskDelay(pdMS_TO_TICKS(50));
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
@@ -1947,6 +2426,9 @@ extern "C" void app_main(void)
 	// Must run before MQTT or any topic-dependent code.
 	device_id_init();
 	mqtt_dispatch_init();
+
+	// Sensible defaults for the LED subsystem (config.json overrides below).
+	led_state_init_defaults();
 
 	user_app_init();
 	user_app_display_init();
