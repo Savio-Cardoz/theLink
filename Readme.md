@@ -104,7 +104,7 @@ All topics are per-device, derived from the last 3 bytes of the factory MAC addr
 | `thelink/{device_id}/evt/log` | Publish | 0 | Device log output (JSON) |
 | `company/command` | Subscribe | 2 | Legacy topic (backward compatible) |
 
-Device ID format: `thelink-XXYYZZ` (e.g. `thelink-0A1B2C`)
+Device ID format: `UUVVWWXXYYZZ` (e.g. `0A1B2C3D4E5F`)
 
 ---
 
@@ -236,7 +236,7 @@ Published as JSON with QoS 0:
 
 ```json
 {
-  "device_id": "thelink-0A1B2C",
+  "device_id": "0A1B2C3D4E5F",
   "level": "info",
   "tag": "app",
   "msg": "Display download complete"

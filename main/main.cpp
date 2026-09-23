@@ -108,7 +108,7 @@ static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
  * @brief Read the base MAC address and build the device ID and MQTT topics.
  *
  * Uses esp_efuse_mac_get_default() so this can run before WiFi init.
- * Format: "thelink-XXYYZZ" where XX, YY, ZZ are the last 3 bytes of the MAC.
+ * Format: "UUVVWWXXYYZZ" where UU, VV, WW, XX, YY, ZZ are the bytes of the MAC.
  * Topics follow: "thelink/<device_id>/cmd/log", etc.
  */
 static void device_id_init(void)
@@ -116,9 +116,9 @@ static void device_id_init(void)
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
 
-    // Device ID: "thelink-XXYYZZ"
-    snprintf(s_device_id, sizeof(s_device_id), "thelink-%02X%02X%02X",
-             mac[3], mac[4], mac[5]);
+    // Device ID: "UUVVWWXXYYZZ"
+    snprintf(s_device_id, sizeof(s_device_id), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     // Topic paths
     snprintf(s_mqtt_cmd_topic_base, sizeof(s_mqtt_cmd_topic_base),
