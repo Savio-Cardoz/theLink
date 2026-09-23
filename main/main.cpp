@@ -49,11 +49,42 @@
 
 #include <mutex>
 #include <cstring>
+#include <atomic>
+#include <math.h>
 
 #define RESET_BUTTON_GPIO   GPIO_NUM_3  // Factory-reset / re-provision button (moved from GPIO18)
 #define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
 
 #define RMT_LED_STRIP_GPIO_NUM gpio_num_t(RGB_LED_STRIP_PIN) // GPIO pin for the RGB LED strip
+
+// ── Provisioning state LED ─────────────────────────────────────────
+// The notification LED pulses at a different interval for each phase of the
+// provisioning workflow. Control returns to MQTT commands once the app is up.
+typedef enum {
+    LED_PROV_STATE_NONE = 0,
+    LED_PROV_STATE_PROVISIONING,   // Provisioning service active      -> 0.5s pulse
+    LED_PROV_STATE_BLE_CONNECTED,  // Provisioning BLE transport linked -> 1.5s pulse
+    LED_PROV_STATE_WIFI_CONNECTED, // Wi-Fi station got an IP           -> 3s pulse
+} led_prov_state_t;
+
+static std::atomic<led_prov_state_t> s_led_prov_state{led_prov_state_t::LED_PROV_STATE_NONE};
+
+// Hue used for all provisioning pulses (blue).
+static constexpr uint32_t PROV_PULSE_HUE = 240;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static uint32_t led_prov_pulse_period_ms(led_prov_state_t state)
+{
+    switch (state) {
+    case led_prov_state_t::LED_PROV_STATE_PROVISIONING:   return 500;
+    case led_prov_state_t::LED_PROV_STATE_BLE_CONNECTED:  return 1500;
+    case led_prov_state_t::LED_PROV_STATE_WIFI_CONNECTED: return 3000;
+    default:                                              return 0;
+    }
+}
 
 // Device ID and MQTT topics are derived from WiFi MAC at runtime.
 // Populated by device_id_init() early in app_main.
@@ -970,6 +1001,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 		{
 		case NETWORK_PROV_START:
 			ESP_LOGI(TAG, "Provisioning started");
+			s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_PROVISIONING);
 			break;
 		case NETWORK_PROV_WIFI_CRED_RECV:
 		{
@@ -1080,6 +1112,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
 		/* Signal main application to continue execution */
 		xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+		s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_WIFI_CONNECTED);
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
 	}
 	else if (event_base == PROTOCOMM_TRANSPORT_BLE_EVENT)
@@ -1088,6 +1121,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 		{
 		case PROTOCOMM_TRANSPORT_BLE_CONNECTED:
 			ESP_LOGI(TAG, "BLE transport: Connected!");
+			s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_BLE_CONNECTED);
 			break;
 		case PROTOCOMM_TRANSPORT_BLE_DISCONNECTED:
 			ESP_LOGI(TAG, "BLE transport: Disconnected!");
@@ -1183,6 +1217,9 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 
 		// Report any OTA cycle that completed while the network was down.
 		ota_publish_pending_event();
+
+		// App is fully up: hand the notification LED back to MQTT control.
+		s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_NONE);
 		break;
 	case MQTT_EVENT_DISCONNECTED:
 		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -1795,8 +1832,31 @@ void led_test_task(void *arg)
 	int hue = 0;
 	int saturation = 100;
 	int value = 100;
+	uint32_t prov_pulse_ms = 0;
+
 	for (;;)
 	{
+		const led_prov_state_t prov_state = s_led_prov_state.load();
+
+		if (prov_state != led_prov_state_t::LED_PROV_STATE_NONE)
+		{
+			const uint32_t period_ms = led_prov_pulse_period_ms(prov_state);
+			if (period_ms > 0)
+			{
+				// Soft breathing pulse peaking in the middle of each interval.
+				prov_pulse_ms = (prov_pulse_ms + 50) % period_ms;
+				const float frac = (float)prov_pulse_ms / (float)period_ms;
+				const float brightness = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac);
+				value = (int)(100.0f * brightness);
+				led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, PROV_PULSE_HUE, 100, (uint32_t)value);
+			}
+
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		prov_pulse_ms = 0;
+
 		{
 			std::lock_guard<std::mutex> lock(led_state.mutex);
 			if (led_state.active)
