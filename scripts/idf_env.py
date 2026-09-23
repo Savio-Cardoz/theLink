@@ -186,11 +186,12 @@ def build_env():
         additions += _tool_dirs_for(("ninja.exe", "ninja"))
         additions += _tool_dirs_for(("cmake.exe", "cmake"))
         additions += _tool_dirs_for(("git.exe",), max_depth=2)
-        additions += _tool_dirs_for(
-            ("xtensa-esp-elf-gcc.exe", "riscv32-esp-elf-gcc.exe"), max_depth=5)
     else:
         additions += _tool_dirs_for(("ninja",))
         additions += _tool_dirs_for(("cmake",))
+    additions += _tool_dirs_for(
+        ("xtensa-esp-elf-gcc", "xtensa-esp-elf-gcc.exe",
+         "riscv32-esp-elf-gcc", "riscv32-esp-elf-gcc.exe"), max_depth=5)
 
     path = env.get("PATH", "")
     parts = path.split(os.pathsep) if path else []

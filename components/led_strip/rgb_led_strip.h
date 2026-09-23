@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <functional>
 #include <stdexcept>
@@ -29,6 +30,7 @@ enum class rgb_pattern_t {
 static rgb_pattern_t pattern_from_string(const std::string &pattern_str)
 {
     static const std::map<std::string, rgb_pattern_t> pattern_map = {
+        {"off", rgb_pattern_t::OFF},
         {"solid_color", rgb_pattern_t::SOLID_COLOR},
         {"rainbow_cycle", rgb_pattern_t::RAINBOW_CYCLE},
         {"theater_chase", rgb_pattern_t::THEATER_CHASE},
@@ -131,13 +133,21 @@ public:
 
     /**
      * @brief Send the currently configured pixel data to the LED strip.
+     *
+     * The global brightness (see setBrightness) is applied to the raw frame
+     * during transmit, so repeated flushes never compound the scaling.
      */
     void flush()
     {
+        std::array<uint8_t, size * 3> scaled;
+        for (size_t i = 0; i < pixel_data_.size(); ++i) {
+            scaled[i] = static_cast<uint8_t>((pixel_data_[i] * brightness_ + 50U) / 100U);
+        }
+
         rmt_transmit_config_t tx_config = {
             .loop_count = 0,
         };
-        ESP_ERROR_CHECK(rmt_transmit(channel_, encoder_, pixel_data_.data(), pixel_data_.size(), &tx_config));
+        ESP_ERROR_CHECK(rmt_transmit(channel_, encoder_, scaled.data(), scaled.size(), &tx_config));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channel_, portMAX_DELAY));
     }
 
@@ -150,17 +160,69 @@ public:
     }
 
     /**
-     * @brief Dispatch an enum value to the registered pattern handler.
+     * @brief Number of pixels in the strip.
      */
-    void runPattern(rgb_pattern_t pattern, uint32_t h = 0, uint32_t s = 100, uint32_t v = 100)
+    static constexpr size_t count()
     {
-        auto it = pattern_map.find(pattern);
-        if (it != pattern_map.end()) {
-            it->second(*this, h, s, v);
-        }
+        return size;
     }
 
-private:
+    /**
+     * @brief Set the global brightness applied at flush time.
+     *
+     * @param brightness Percent brightness [0, 100].
+     */
+    void setBrightness(uint8_t brightness)
+    {
+        brightness_ = brightness > 100 ? 100 : brightness;
+    }
+
+    /**
+     * @brief Current global brightness in percent.
+     */
+    uint8_t brightness() const
+    {
+        return brightness_;
+    }
+
+    /**
+     * @brief Set every pixel to a single RGB color.
+     */
+    void setAllRgb(uint8_t r, uint8_t g, uint8_t b)
+    {
+        setRgb(r, g, b);
+    }
+
+    /**
+     * @brief Set a single pixel using RGB values.
+     */
+    void setPixelRgb(size_t index, uint8_t r, uint8_t g, uint8_t b)
+    {
+        setRgbAt(index, r, g, b);
+    }
+
+    /**
+     * @brief Set a single pixel using HSV values.
+     */
+    void setPixelHsv(size_t index, uint32_t h, uint32_t s, uint32_t v)
+    {
+        setHsvAt(index, h, s, v);
+    }
+
+    /**
+     * @brief Turn all pixels off and flush.
+     */
+    void clear()
+    {
+        setRgb(0, 0, 0);
+        flush();
+    }
+
+    /**
+     * @brief Convert HSV to RGB.
+     *
+     * @param h Hue [0, 360). @param s Saturation [0, 100]. @param v Value [0, 100].
+     */
     static void hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint8_t &r, uint8_t &g, uint8_t &b)
     {
         h %= 360;
@@ -204,6 +266,59 @@ private:
         }
     }
 
+    /**
+     * @brief Convert RGB to HSV.
+     *
+     * @param r,g,b Channel values [0, 255].
+     * @param h Hue [0, 360). @param s Saturation [0, 100]. @param v Value [0, 100].
+     */
+    static void rgb2hsv(uint8_t r, uint8_t g, uint8_t b, uint32_t &h, uint32_t &s, uint32_t &v)
+    {
+        const float fr = r / 255.0f;
+        const float fg = g / 255.0f;
+        const float fb = b / 255.0f;
+        const float mx = std::max(fr, std::max(fg, fb));
+        const float mn = std::min(fr, std::min(fg, fb));
+        const float d = mx - mn;
+
+        float hu = 0.0f;
+        float sat = 0.0f;
+        const float val = mx;
+
+        if (d > 0.0f) {
+            if (mx == fr) {
+                hu = 60.0f * (std::fmod((fg - fb) / d, 6.0f));
+            } else if (mx == fg) {
+                hu = 60.0f * ((fb - fr) / d + 2.0f);
+            } else {
+                hu = 60.0f * ((fr - fg) / d + 4.0f);
+            }
+            sat = d / mx;
+        }
+
+        if (hu < 0.0f) {
+            hu += 360.0f;
+        }
+        h = static_cast<uint32_t>(hu + 0.5f);
+        if (h >= 360) {
+            h = 359;
+        }
+        s = static_cast<uint32_t>(sat * 100.0f + 0.5f);
+        v = static_cast<uint32_t>(val * 100.0f + 0.5f);
+    }
+
+    /**
+     * @brief Dispatch an enum value to the registered pattern handler.
+     */
+    void runPattern(rgb_pattern_t pattern, uint32_t h = 0, uint32_t s = 100, uint32_t v = 100)
+    {
+        auto it = pattern_map.find(pattern);
+        if (it != pattern_map.end()) {
+            it->second(*this, h, s, v);
+        }
+    }
+
+private:
     void setRgb(uint8_t r, uint8_t g, uint8_t b)
     {
         for (size_t i = 0; i < size; ++i) {
@@ -221,6 +336,7 @@ private:
 
     rmt_channel_handle_t channel_;
     rmt_encoder_handle_t encoder_;
+    uint8_t brightness_ = 100;
     std::array<uint8_t, size * 3> pixel_data_;
 
     std::map<rgb_pattern_t, std::function<void(RgbLedStrip&, uint32_t, uint32_t, uint32_t)>> pattern_map = {

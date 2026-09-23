@@ -101,6 +101,7 @@ All topics are per-device, derived from the last 3 bytes of the factory MAC addr
 | `thelink/{device_id}/cmd/ota` | Subscribe | 1 | Trigger firmware update download |
 | `thelink/{device_id}/cmd/log` | Subscribe | 1 | Send logger control commands |
 | `thelink/{device_id}/evt/ota` | Publish | 1 | Firmware update status events |
+| `thelink/{device_id}/evt/led` | Publish | 1 | LED state acknowledgement (retained) |
 | `thelink/{device_id}/evt/log` | Publish | 0 | Device log output (JSON) |
 | `company/command` | Subscribe | 2 | Legacy topic (backward compatible) |
 
@@ -130,28 +131,60 @@ Image format: LVGL I8 (indexed 8-bit, 200x200, with 256-color palette).
 
 ### RGB LED (`thelink/{device_id}/cmd/rgb`)
 
-Sets the LED strip pattern.
+Sets the LED strip colour, pattern, brightness, speed, and per-pixel overrides.
+All fields are optional; omitted fields keep their current value. Messages with
+just `pattern` or `enable` (the legacy format) still work.
 
 ```json
 {
-  "pattern": "scanner"
+  "enable": true,
+  "pattern": "rainbow_cycle",
+  "color": { "h": 210, "s": 100, "v": 60 },
+  "brightness": 75,
+  "speed": 40,
+  "pixels": ["#FF0000", "#00FF00", null],
+  "duration": 30,
+  "persist": true
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `pattern` | string | Yes | Pattern name (see table below) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable` | bool | — | Master on/off; `false` turns the strip off immediately |
+| `pattern` | string | keep | Pattern name (see table below) |
+| `color` | string/object | keep | `"#RRGGBB"`, `{"h":0-360,"s":0-100,"v":0-100}`, or `{"r","g","b":0-255}` |
+| `brightness` | number | 100 | Global brightness scale 0-100 (applies to patterns and pixels) |
+| `speed` | number | 20 | Animation frame period in ms (5-5000); lower = faster |
+| `pixels` | array | — | Up to 16 per-LED values (`null`/missing entries are skipped); overrides `pattern` while present |
+| `duration` | number | — | Auto-off after N seconds (0 or absent = no auto-off) |
+| `persist` | bool | true | Persist the state to `/sdcard/config.json` |
 
 **Available patterns:**
 
 | Pattern | Description |
 |---------|-------------|
+| `off` | Turns the strip off |
 | `solid_color` | Single static color (default when inactive) |
 | `rainbow_cycle` | Smooth rainbow cycle across all LEDs |
 | `theater_chase` | Theater-style chasing light effect |
 | `color_wipe` | Sequential color fill |
 | `scanner` | Scanning light sweep back and forth |
 | `fade` | Breathing fade effect |
+
+The accepted state is acknowledged on **`thelink/{device_id}/evt/led`** (retained,
+QoS 1):
+
+```json
+{
+  "active": true,
+  "pattern": "rainbow_cycle",
+  "color": { "h": 210, "s": 100, "v": 60 },
+  "brightness": 75,
+  "speed": 40,
+  "pixels": ["#FF0000", null],
+  "cmd_id": 12
+}
+```
 
 ### Audio (`thelink/{device_id}/cmd/audio`)
 
