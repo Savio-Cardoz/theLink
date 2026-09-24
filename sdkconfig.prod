@@ -1,0 +1,13 @@
+# Production build profile defaults.
+# Overlaid on top of sdkconfig.defaults via SDKCONFIG_DEFAULTS (see scripts/build.py).
+# Uses the OTA partition table for esp32_factory_app (partitions.csv: factory +
+# ota_0). The main app lives in ota_0; the factory partition holds the
+# bootloader app (esp32_factory_app).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Bootloader rollback: lets the bootloader mark a freshly flashed ota_0 as
+# ABORTED when it fails its first-boot test, so control returns to the factory
+# app which can restore /sdcard/boot_backup.bin.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

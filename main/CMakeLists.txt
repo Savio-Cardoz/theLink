@@ -1,3 +1,5 @@
-idf_component_register(SRCS "app_main.cpp"
-                    INCLUDE_DIRS "."
-                    REQUIRES epaper json mbedtls driver esp_http_client esp-tls nvs_flash esp_event esp_wifi wifi_provisioning)
+idf_component_register(SRCS "data_downloader.cpp" "main.cpp" "wifi.c" "wifi_no.c"
+                    INCLUDE_DIRS "./"
+                    REQUIRES led_strip sdcard_manager esp_http_client user_app nvs_flash mqtt json mqtt_logger audio_bsp app_update
+                    PRIV_REQUIRES codec_board
+)

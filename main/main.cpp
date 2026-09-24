@@ -1,0 +1,2930 @@
+
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "user_app.h"
+#include "lvgl.h"
+#include "user_config.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_err.h"
+
+// Wifi provisioning includes
+#include <string.h>
+#include <freertos/task.h>
+#include <freertos/event_groups.h>
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include <network_provisioning/manager.h>
+#include <network_provisioning/scheme_ble.h>
+#include "qrcode.h"
+
+#include "mqtt_client.h"
+#include <map>
+#include <functional>
+
+#include "freertos/queue.h"
+#include "cJSON.h" // Strongly recommended for parsing the MQTT payload
+// External reference to the class we built in the previous step
+// Make sure you include the header where AsyncDownloader is defined
+#include "data_downloader.hpp"
+
+#include "sdcard_manager.hpp"
+#include "user_config.h"
+
+#include "driver/gpio.h"  // Ensure this header is included
+#include "esp_heap_caps.h"
+
+#include "rgb_led_strip.h"
+#include "mqtt_logger.h"
+#include "esp_mac.h"
+#include "audio_bsp.h"
+#include "codec_init.h"
+
+#include "esp_system.h"
+#include "esp_partition.h"
+#include "esp_ota_ops.h"
+
+#include <mutex>
+#include <cstring>
+#include <atomic>
+#include <math.h>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+
+#define RESET_BUTTON_GPIO   GPIO_NUM_3  // Factory-reset / re-provision button (moved from GPIO18)
+#define BUTTON_PRESSED_LEVEL 0           // Active-low configuration
+
+#define RMT_LED_STRIP_GPIO_NUM gpio_num_t(RGB_LED_STRIP_PIN) // GPIO pin for the RGB LED strip
+
+// ── Provisioning state LED ─────────────────────────────────────────
+// The notification LED pulses at a different interval for each phase of the
+// provisioning workflow. Control returns to MQTT commands once the app is up.
+typedef enum {
+    LED_PROV_STATE_NONE = 0,
+    LED_PROV_STATE_PROVISIONING,   // Provisioning service active      -> 0.5s pulse
+    LED_PROV_STATE_BLE_CONNECTED,  // Provisioning BLE transport linked -> 1.5s pulse
+    LED_PROV_STATE_WIFI_CONNECTED, // Wi-Fi station got an IP           -> 3s pulse
+} led_prov_state_t;
+
+static std::atomic<led_prov_state_t> s_led_prov_state{led_prov_state_t::LED_PROV_STATE_NONE};
+
+// Hue used for all provisioning pulses (blue).
+static constexpr uint32_t PROV_PULSE_HUE = 240;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static uint32_t led_prov_pulse_period_ms(led_prov_state_t state)
+{
+    switch (state) {
+    case led_prov_state_t::LED_PROV_STATE_PROVISIONING:   return 500;
+    case led_prov_state_t::LED_PROV_STATE_BLE_CONNECTED:  return 1500;
+    case led_prov_state_t::LED_PROV_STATE_WIFI_CONNECTED: return 3000;
+    default:                                              return 0;
+    }
+}
+
+// Device ID and MQTT topics are derived from WiFi MAC at runtime.
+// Populated by device_id_init() early in app_main.
+#define DEVICE_ID_MAX_LEN      32
+#define MQTT_TOPIC_MAX_LEN     64
+
+static char s_device_id[DEVICE_ID_MAX_LEN];
+static char s_mqtt_cmd_topic_base[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_topic_base[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_log_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_display_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_rgb_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_audio_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_notification_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_ota_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_led_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_ota_topic[MQTT_TOPIC_MAX_LEN];
+
+static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
+
+/**
+ * @brief Read the base MAC address and build the device ID and MQTT topics.
+ *
+ * Uses esp_efuse_mac_get_default() so this can run before WiFi init.
+ * Format: "UUVVWWXXYYZZ" where UU, VV, WW, XX, YY, ZZ are the bytes of the MAC.
+ * Topics follow: "thelink/<device_id>/cmd/log", etc.
+ */
+static void device_id_init(void)
+{
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+
+    // Device ID: "UUVVWWXXYYZZ"
+    snprintf(s_device_id, sizeof(s_device_id), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    // Topic paths
+    snprintf(s_mqtt_cmd_topic_base, sizeof(s_mqtt_cmd_topic_base),
+             "thelink/%s/cmd/", s_device_id);
+    snprintf(s_mqtt_evt_topic_base, sizeof(s_mqtt_evt_topic_base),
+             "thelink/%s/evt/", s_device_id);
+    snprintf(s_mqtt_cmd_log_topic, sizeof(s_mqtt_cmd_log_topic),
+             "thelink/%s/cmd/log", s_device_id);
+    snprintf(s_mqtt_cmd_display_topic, sizeof(s_mqtt_cmd_display_topic),
+             "thelink/%s/cmd/display", s_device_id);
+    snprintf(s_mqtt_cmd_rgb_topic, sizeof(s_mqtt_cmd_rgb_topic),
+             "thelink/%s/cmd/rgb", s_device_id);
+    snprintf(s_mqtt_cmd_audio_topic, sizeof(s_mqtt_cmd_audio_topic),
+             "thelink/%s/cmd/audio", s_device_id);
+    snprintf(s_mqtt_cmd_notification_topic, sizeof(s_mqtt_cmd_notification_topic),
+             "thelink/%s/cmd/notification", s_device_id);
+    snprintf(s_mqtt_cmd_ota_topic, sizeof(s_mqtt_cmd_ota_topic),
+             "thelink/%s/cmd/ota", s_device_id);
+    snprintf(s_mqtt_evt_led_topic, sizeof(s_mqtt_evt_led_topic),
+             "thelink/%s/evt/led", s_device_id);
+    snprintf(s_mqtt_evt_ota_topic, sizeof(s_mqtt_evt_ota_topic),
+             "thelink/%s/evt/ota", s_device_id);
+
+    ESP_LOGI("DEVICE", "Device ID: %s", s_device_id);
+    ESP_LOGI("DEVICE", "Log cmd topic: %s", s_mqtt_cmd_log_topic);
+    ESP_LOGI("DEVICE", "Display cmd topic: %s", s_mqtt_cmd_display_topic);
+    ESP_LOGI("DEVICE", "RGB cmd topic: %s", s_mqtt_cmd_rgb_topic);
+    ESP_LOGI("DEVICE", "Audio cmd topic: %s", s_mqtt_cmd_audio_topic);
+    ESP_LOGI("DEVICE", "Notification cmd topic: %s", s_mqtt_cmd_notification_topic);
+    ESP_LOGI("DEVICE", "OTA cmd topic: %s", s_mqtt_cmd_ota_topic);
+    ESP_LOGI("DEVICE", "LED evt topic: %s", s_mqtt_evt_led_topic);
+    ESP_LOGI("DEVICE", "OTA evt topic: %s", s_mqtt_evt_ota_topic);
+}
+
+// 2. Global Widget Pointers
+lv_obj_t *wifi_status_icon = NULL; // Overlay widget container
+lv_obj_t *prov_qr_code_widget = NULL; // Handle for provisioning QR code screen
+
+/**
+ * @brief Checks if the reset button is being held down at boot.
+ * @return true if pressed, false otherwise.
+ */
+static bool check_reset_button_at_boot(void)
+{
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << RESET_BUTTON_GPIO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    // Allow the lines to settle and give the user a tiny 200ms window 
+    // to make sure they are intentionally holding the button down
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (gpio_get_level(RESET_BUTTON_GPIO) == BUTTON_PRESSED_LEVEL)
+    {
+        ESP_LOGW("RESET", "Reset button detected down at power-up! Holding for confirmation...");
+        // Optional: Wait an extra second to avoid accidental triggers
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        return (gpio_get_level(RESET_BUTTON_GPIO) == BUTTON_PRESSED_LEVEL);
+    }
+    
+    return false;
+}
+
+// ==========================================================
+// 2. Data Definitions & Structures
+// ==========================================================
+#define MAX_URL_LEN 256
+#define MAX_FILE_LEN 64
+
+// 1. External Asset References
+extern const lv_image_dsc_t wifi;    // Valid connection image asset
+extern const lv_image_dsc_t wifi_no; // Missing connection image asset
+extern lv_obj_t *dynamic_epd_image;
+
+// 3. UI Status Event Definitions
+typedef enum {
+    UI_WIFI_DISCONNECTED,
+    UI_WIFI_CONNECTED
+} ui_event_type_t;
+
+ui_event_type_t wifi_status = ui_event_type_t::UI_WIFI_DISCONNECTED;
+// Persistent structures for the live binary QR matrix layout engine
+static lv_image_dsc_t qr_dynamic_bmp;
+static uint8_t *qr_pixel_buffer = NULL;
+static lv_obj_t *qr_image_obj = NULL;
+
+// Queue to safely pass state transitions to the LVGL thread
+static QueueHandle_t ui_event_queue = NULL;
+
+// Download target routing
+typedef enum {
+	DOWNLOAD_TARGET_DISPLAY,
+	DOWNLOAD_TARGET_AUDIO,
+	DOWNLOAD_TARGET_FIRMWARE
+} download_target_t;
+
+// The structure passed through the FreeRTOS Queue
+typedef struct
+{
+	char url[MAX_URL_LEN];
+	char filename[MAX_FILE_LEN];
+	download_target_t target;
+} DownloadCommand_t;
+
+// ── Per-subsystem typed state structs ────────────────────────────────
+
+struct display_state_t {
+	bool active;
+	std::mutex mutex;
+	std::string data_path;
+	uint32_t cmd_id;
+};
+
+// Number of pixels on the RGB LED ring.
+static constexpr size_t LED_COUNT = 16;
+
+struct led_state_t {
+	bool active;
+	std::mutex mutex;
+	rgb_pattern_t pattern;
+	char pattern_name[32];
+	uint16_t hue;             // base hue [0, 359]
+	uint8_t saturation;       // [0, 100]
+	uint8_t value;            // [0, 100]
+	uint8_t brightness;       // global brightness scale [0, 100]
+	uint32_t speed_ms;        // animation frame period [5, 5000] ms
+	uint32_t duration_ms;     // auto-off deadline span; 0 = no auto-off
+	uint64_t set_at_ms;       // esp_timer epoch (ms) when colour state was set
+	bool has_pixels;          // per-pixel overrides active
+	std::array<int32_t, LED_COUNT> pixels; // -1 = skip, else 0xRRGGBB
+	uint32_t cmd_id;
+};
+
+static uint32_t s_led_cmd_seq = 0;
+
+struct audio_state_t {
+	bool active;
+	std::mutex mutex;
+	char filename[64];
+	uint8_t volume;
+	uint32_t cmd_id;
+};
+
+display_state_t display_state;
+led_state_t led_state;
+audio_state_t audio_state;
+
+static void led_state_init_defaults(void)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	led_state.active = false;
+	led_state.pattern = rgb_pattern_t::SOLID_COLOR;
+	led_state.pattern_name[0] = '\0';
+	led_state.hue = 0;
+	led_state.saturation = 100;
+	led_state.value = 100;
+	led_state.brightness = 100;
+	led_state.speed_ms = 20;
+	led_state.duration_ms = 0;
+	led_state.set_at_ms = 0;
+	led_state.has_pixels = false;
+	led_state.pixels.fill(-1);
+	led_state.cmd_id = 0;
+}
+
+std::mutex notification_mutex;
+
+TaskHandle_t display_task_handle = NULL;
+TaskHandle_t rgb_task_handle = NULL;
+TaskHandle_t audio_task_handle = NULL;
+TaskHandle_t notification_task_handle = NULL;
+
+// Forward declarations for notification getter/setters
+bool get_notification_state();
+void set_notification_state(bool state);
+void set_notification_message(const std::string &message);
+std::string get_notification_message();
+
+// Global Handle for the Queue
+static QueueHandle_t download_cmd_queue = NULL;
+static IFileSystem *sdcard = nullptr;
+
+extern lv_obj_t *dynamic_epd_image;
+
+static const char *TAG = "app";
+
+static void log_heap_info(const char *context)
+{
+	uint32_t total_free = esp_get_free_heap_size();
+	uint32_t total_min = esp_get_minimum_free_heap_size();
+	uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	uint32_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	ESP_LOGI(TAG, "[HEAP] %s: total_free=%" PRIu32 ", total_min=%" PRIu32 " | INTERNAL free=%" PRIu32 ", largest_blk=%" PRIu32,
+			 context, total_free, total_min, int_free, int_largest);
+}
+
+// Wifi provisioning definitions
+#if CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
+#if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
+#define PROV_SEC2_USERNAME "wifiprov"
+#define PROV_SEC2_PWD "abcd1234"
+
+/* This salt,verifier has been generated for username = "wifiprov" and password = "abcd1234"
+ * IMPORTANT NOTE: For production cases, this must be unique to every device
+ * and should come from device manufacturing partition.*/
+static const char sec2_salt[] = {
+	0x03, 0x6e, 0xe0, 0xc7, 0xbc, 0xb9, 0xed, 0xa8, 0x4c, 0x9e, 0xac, 0x97, 0xd9, 0x3d, 0xec, 0xf4};
+
+static const char sec2_verifier[] = {
+	0x7c, 0x7c, 0x85, 0x47, 0x65, 0x08, 0x94, 0x6d, 0xd6, 0x36, 0xaf, 0x37, 0xd7, 0xe8, 0x91, 0x43,
+	0x78, 0xcf, 0xfd, 0x61, 0x6c, 0x59, 0xd2, 0xf8, 0x39, 0x08, 0x12, 0x72, 0x38, 0xde, 0x9e, 0x24,
+	0xa4, 0x70, 0x26, 0x1c, 0xdf, 0xa9, 0x03, 0xc2, 0xb2, 0x70, 0xe7, 0xb1, 0x32, 0x24, 0xda, 0x11,
+	0x1d, 0x97, 0x18, 0xdc, 0x60, 0x72, 0x08, 0xcc, 0x9a, 0xc9, 0x0c, 0x48, 0x27, 0xe2, 0xae, 0x89,
+	0xaa, 0x16, 0x25, 0xb8, 0x04, 0xd2, 0x1a, 0x9b, 0x3a, 0x8f, 0x37, 0xf6, 0xe4, 0x3a, 0x71, 0x2e,
+	0xe1, 0x27, 0x86, 0x6e, 0xad, 0xce, 0x28, 0xff, 0x54, 0x46, 0x60, 0x1f, 0xb9, 0x96, 0x87, 0xdc,
+	0x57, 0x40, 0xa7, 0xd4, 0x6c, 0xc9, 0x77, 0x54, 0xdc, 0x16, 0x82, 0xf0, 0xed, 0x35, 0x6a, 0xc4,
+	0x70, 0xad, 0x3d, 0x90, 0xb5, 0x81, 0x94, 0x70, 0xd7, 0xbc, 0x65, 0xb2, 0xd5, 0x18, 0xe0, 0x2e,
+	0xc3, 0xa5, 0xf9, 0x68, 0xdd, 0x64, 0x7b, 0xb8, 0xb7, 0x3c, 0x9c, 0xfc, 0x00, 0xd8, 0x71, 0x7e,
+	0xb7, 0x9a, 0x7c, 0xb1, 0xb7, 0xc2, 0xc3, 0x18, 0x34, 0x29, 0x32, 0x43, 0x3e, 0x00, 0x99, 0xe9,
+	0x82, 0x94, 0xe3, 0xd8, 0x2a, 0xb0, 0x96, 0x29, 0xb7, 0xdf, 0x0e, 0x5f, 0x08, 0x33, 0x40, 0x76,
+	0x52, 0x91, 0x32, 0x00, 0x9f, 0x97, 0x2c, 0x89, 0x6c, 0x39, 0x1e, 0xc8, 0x28, 0x05, 0x44, 0x17,
+	0x3f, 0x68, 0x02, 0x8a, 0x9f, 0x44, 0x61, 0xd1, 0xf5, 0xa1, 0x7e, 0x5a, 0x70, 0xd2, 0xc7, 0x23,
+	0x81, 0xcb, 0x38, 0x68, 0xe4, 0x2c, 0x20, 0xbc, 0x40, 0x57, 0x76, 0x17, 0xbd, 0x08, 0xb8, 0x96,
+	0xbc, 0x26, 0xeb, 0x32, 0x46, 0x69, 0x35, 0x05, 0x8c, 0x15, 0x70, 0xd9, 0x1b, 0xe9, 0xbe, 0xcc,
+	0xa9, 0x38, 0xa6, 0x67, 0xf0, 0xad, 0x50, 0x13, 0x19, 0x72, 0x64, 0xbf, 0x52, 0xc2, 0x34, 0xe2,
+	0x1b, 0x11, 0x79, 0x74, 0x72, 0xbd, 0x34, 0x5b, 0xb1, 0xe2, 0xfd, 0x66, 0x73, 0xfe, 0x71, 0x64,
+	0x74, 0xd0, 0x4e, 0xbc, 0x51, 0x24, 0x19, 0x40, 0x87, 0x0e, 0x92, 0x40, 0xe6, 0x21, 0xe7, 0x2d,
+	0x4e, 0x37, 0x76, 0x2f, 0x2e, 0xe2, 0x68, 0xc7, 0x89, 0xe8, 0x32, 0x13, 0x42, 0x06, 0x84, 0x84,
+	0x53, 0x4a, 0xb3, 0x0c, 0x1b, 0x4c, 0x8d, 0x1c, 0x51, 0x97, 0x19, 0xab, 0xae, 0x77, 0xff, 0xdb,
+	0xec, 0xf0, 0x10, 0x95, 0x34, 0x33, 0x6b, 0xcb, 0x3e, 0x84, 0x0f, 0xb9, 0xd8, 0x5f, 0xb8, 0xa0,
+	0xb8, 0x55, 0x53, 0x3e, 0x70, 0xf7, 0x18, 0xf5, 0xce, 0x7b, 0x4e, 0xbf, 0x27, 0xce, 0xce, 0xa8,
+	0xb3, 0xbe, 0x40, 0xc5, 0xc5, 0x32, 0x29, 0x3e, 0x71, 0x64, 0x9e, 0xde, 0x8c, 0xf6, 0x75, 0xa1,
+	0xe6, 0xf6, 0x53, 0xc8, 0x31, 0xa8, 0x78, 0xde, 0x50, 0x40, 0xf7, 0x62, 0xde, 0x36, 0xb2, 0xba};
+
+#endif
+
+// ── LED colour helpers ──────────────────────────────────────────────
+
+static const char *pattern_to_string(rgb_pattern_t pattern)
+{
+	switch (pattern)
+	{
+	case rgb_pattern_t::OFF: return "off";
+	case rgb_pattern_t::SOLID_COLOR: return "solid_color";
+	case rgb_pattern_t::RAINBOW_CYCLE: return "rainbow_cycle";
+	case rgb_pattern_t::THEATER_CHASE: return "theater_chase";
+	case rgb_pattern_t::COLOR_WIPE: return "color_wipe";
+	case rgb_pattern_t::SCANNER: return "scanner";
+	case rgb_pattern_t::FADE: return "fade";
+	}
+	return "solid_color";
+}
+
+static uint32_t clamp_u(long long value, long long lo, long long hi)
+{
+	if (value < lo) value = lo;
+	if (value > hi) value = hi;
+	return static_cast<uint32_t>(value);
+}
+
+static bool hex_to_rgb(const char *str, uint8_t &r, uint8_t &g, uint8_t &b)
+{
+	if (str == nullptr)
+	{
+		return false;
+	}
+	const char *p = str;
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p == '#') p++;
+
+	size_t len = 0;
+	while (p[len] != '\0' && p[len] != ' ' && p[len] != '\t') len++;
+	if (len != 6)
+	{
+		return false;
+	}
+
+	char *endptr = nullptr;
+	unsigned long val = strtoul(p, &endptr, 16);
+	if (endptr == p || *endptr != '\0')
+	{
+		return false;
+	}
+	r = static_cast<uint8_t>((val >> 16) & 0xFF);
+	g = static_cast<uint8_t>((val >> 8) & 0xFF);
+	b = static_cast<uint8_t>(val & 0xFF);
+	return true;
+}
+
+// Parsed colour: valid flag + both HSV (uniform internal form) and RGB.
+struct led_color_t {
+	bool valid = false;
+	uint32_t h = 0;
+	uint32_t s = 0;
+	uint32_t v = 0;
+	uint8_t r = 0;
+	uint8_t g = 0;
+	uint8_t b = 0;
+};
+
+// Accepts "#RRGGBB" (or "RRGGBB"), {h,s,v} (h 0-360, s/v 0-100), or {r,g,b}.
+static led_color_t parse_led_color(cJSON *item)
+{
+	if (cJSON_IsString(item) && item->valuestring != NULL)
+	{
+		uint8_t r, g, b;
+		if (hex_to_rgb(item->valuestring, r, g, b))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.r = r; out.g = g; out.b = b;
+			RgbLedStrip<LED_COUNT>::rgb2hsv(r, g, b, out.h, out.s, out.v);
+			return out;
+		}
+		return {};
+	}
+
+	if (cJSON_IsObject(item))
+	{
+		cJSON *h = cJSON_GetObjectItemCaseSensitive(item, "h");
+		cJSON *s = cJSON_GetObjectItemCaseSensitive(item, "s");
+		cJSON *v = cJSON_GetObjectItemCaseSensitive(item, "v");
+		if (cJSON_IsNumber(h) && cJSON_IsNumber(s) && cJSON_IsNumber(v))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.h = clamp_u(h->valueint, 0, 359);
+			out.s = clamp_u(s->valueint, 0, 100);
+			out.v = clamp_u(v->valueint, 0, 100);
+			RgbLedStrip<LED_COUNT>::hsv2rgb(out.h, out.s, out.v, out.r, out.g, out.b);
+			return out;
+		}
+
+		cJSON *r = cJSON_GetObjectItemCaseSensitive(item, "r");
+		cJSON *g = cJSON_GetObjectItemCaseSensitive(item, "g");
+		cJSON *b = cJSON_GetObjectItemCaseSensitive(item, "b");
+		if (cJSON_IsNumber(r) && cJSON_IsNumber(g) && cJSON_IsNumber(b))
+		{
+			led_color_t out;
+			out.valid = true;
+			out.r = static_cast<uint8_t>(clamp_u(r->valueint, 0, 255));
+			out.g = static_cast<uint8_t>(clamp_u(g->valueint, 0, 255));
+			out.b = static_cast<uint8_t>(clamp_u(b->valueint, 0, 255));
+			RgbLedStrip<LED_COUNT>::rgb2hsv(out.r, out.g, out.b, out.h, out.s, out.v);
+			return out;
+		}
+	}
+
+	return {};
+}
+
+// Publish the canonical LED state to thelink/{id}/evt/led (retained) as an
+// acknowledgement so brokers/integrators always have the authoritative state.
+static void publish_led_event(void)
+{
+	if (s_mqtt_client == nullptr)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_CreateObject();
+	if (root == nullptr)
+	{
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(led_state.mutex);
+
+		cJSON_AddBoolToObject(root, "active", led_state.active);
+		cJSON_AddStringToObject(root, "pattern", pattern_to_string(led_state.pattern));
+
+		cJSON *color = cJSON_CreateObject();
+		cJSON_AddNumberToObject(color, "h", led_state.hue);
+		cJSON_AddNumberToObject(color, "s", led_state.saturation);
+		cJSON_AddNumberToObject(color, "v", led_state.value);
+		cJSON_AddItemToObject(root, "color", color);
+
+		cJSON_AddNumberToObject(root, "brightness", led_state.brightness);
+		cJSON_AddNumberToObject(root, "speed", led_state.speed_ms);
+		cJSON_AddNumberToObject(root, "cmd_id", led_state.cmd_id);
+
+		if (led_state.has_pixels)
+		{
+			cJSON *pixels = cJSON_CreateArray();
+			for (size_t i = 0; i < LED_COUNT; i++)
+			{
+				int32_t px = led_state.pixels[i];
+				if (px < 0)
+				{
+					cJSON_AddItemToArray(pixels, cJSON_CreateNull());
+				}
+				else
+				{
+					char hex[10];
+					snprintf(hex, sizeof(hex), "#%06X", (unsigned)px);
+					cJSON_AddItemToArray(pixels, cJSON_CreateString(hex));
+				}
+			}
+			cJSON_AddItemToObject(root, "pixels", pixels);
+		}
+	}
+
+	char *payload = cJSON_Print(root);
+	if (payload != nullptr)
+	{
+		esp_mqtt_client_publish(s_mqtt_client, s_mqtt_evt_led_topic, payload, 0, 1, 1);
+		free(payload);
+	}
+	cJSON_Delete(root);
+}
+
+void save_settings_to_json(void)
+{
+    // Create the root JSON object structure
+    cJSON *root = cJSON_CreateObject();
+    
+    // Add display path string
+    {
+        std::lock_guard<std::mutex> lock(display_state.mutex);
+        cJSON_AddStringToObject(root, "display", display_state.data_path.c_str());
+    }
+    
+    // Add LED pattern state as a structured object
+    {
+        std::lock_guard<std::mutex> lock(led_state.mutex);
+
+        cJSON *led = cJSON_CreateObject();
+        cJSON_AddBoolToObject(led, "active", led_state.active);
+        cJSON_AddStringToObject(led, "pattern", pattern_to_string(led_state.pattern));
+
+        cJSON *color = cJSON_CreateObject();
+        cJSON_AddNumberToObject(color, "h", led_state.hue);
+        cJSON_AddNumberToObject(color, "s", led_state.saturation);
+        cJSON_AddNumberToObject(color, "v", led_state.value);
+        cJSON_AddItemToObject(led, "color", color);
+
+        cJSON_AddNumberToObject(led, "brightness", led_state.brightness);
+        cJSON_AddNumberToObject(led, "speed", led_state.speed_ms);
+
+        if (led_state.has_pixels)
+        {
+            cJSON *pixels = cJSON_CreateArray();
+            for (size_t i = 0; i < LED_COUNT; i++)
+            {
+                int32_t px = led_state.pixels[i];
+                if (px < 0)
+                {
+                    cJSON_AddItemToArray(pixels, cJSON_CreateNull());
+                }
+                else
+                {
+                    char hex[10];
+                    snprintf(hex, sizeof(hex), "#%06X", (unsigned)px);
+                    cJSON_AddItemToArray(pixels, cJSON_CreateString(hex));
+                }
+            }
+            cJSON_AddItemToObject(led, "pixels", pixels);
+        }
+
+        cJSON_AddItemToObject(root, "led", led);
+    }
+
+    char *json_str = cJSON_Print(root);
+    if (json_str != NULL)
+    {
+        FILE *f = fopen("/sdcard/config.json", "w");
+        if (f != NULL)
+        {
+            fputs(json_str, f);
+            fclose(f);
+            ESP_LOGI("CONFIG", "Configuration saved successfully to SD Card.");
+        }
+        else
+        {
+            ESP_LOGE("CONFIG", "Failed to open config.json for writing!");
+        }
+        free(json_str); // Always free memory allocated by cJSON_Print
+    }
+    cJSON_Delete(root);
+}
+
+void load_settings_from_json(void)
+{
+    FILE *f = fopen("/sdcard/config.json", "r");
+    if (f == NULL)
+    {
+        ESP_LOGW("CONFIG", "No config.json found on SD Card. Using defaults.");
+        return;
+    }
+
+    // Determine file size to allocate buffer space cleanly
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *json_buf = (char *)malloc(file_size + 1);
+    if (json_buf != NULL)
+    {
+        fread(json_buf, 1, file_size, f);
+        json_buf[file_size] = '\0';
+        fclose(f);
+
+        cJSON *json = cJSON_Parse(json_buf);
+        if (json != NULL)
+        {
+            // Parse and apply Display Path parameters
+            cJSON *display_item = cJSON_GetObjectItemCaseSensitive(json, "display");
+            if (cJSON_IsString(display_item) && (display_item->valuestring != NULL))
+            {
+                display_state.data_path = std::string(display_item->valuestring);
+                display_state.active = true;
+                ESP_LOGI("CONFIG", "Restored display state path: %s", display_state.data_path.c_str());
+            }
+
+            // Parse and apply LED notification parameters
+            cJSON *led_item = cJSON_GetObjectItemCaseSensitive(json, "led");
+            if (led_item != nullptr)
+            {
+                if (cJSON_IsString(led_item) && led_item->valuestring != NULL)
+                {
+                    // Legacy format: "active" / "inactive"
+                    set_notification_state(strcmp(led_item->valuestring, "active") == 0);
+                    ESP_LOGI("CONFIG", "Restored notification LED state: %s", led_item->valuestring);
+                }
+                else if (cJSON_IsObject(led_item))
+                {
+                    std::lock_guard<std::mutex> lock(led_state.mutex);
+
+                    cJSON *a = cJSON_GetObjectItemCaseSensitive(led_item, "active");
+                    if (cJSON_IsBool(a))
+                    {
+                        led_state.active = cJSON_IsTrue(a);
+                    }
+
+                    cJSON *p = cJSON_GetObjectItemCaseSensitive(led_item, "pattern");
+                    if (cJSON_IsString(p) && p->valuestring != NULL)
+                    {
+                        led_state.pattern = pattern_from_string(p->valuestring);
+                        strncpy(led_state.pattern_name, p->valuestring, sizeof(led_state.pattern_name) - 1);
+                        led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+                    }
+
+                    cJSON *c = cJSON_GetObjectItemCaseSensitive(led_item, "color");
+                    if (c != nullptr && !cJSON_IsNull(c))
+                    {
+                        led_color_t col = parse_led_color(c);
+                        if (col.valid)
+                        {
+                            led_state.hue = static_cast<uint16_t>(col.h);
+                            led_state.saturation = static_cast<uint8_t>(col.s);
+                            led_state.value = static_cast<uint8_t>(col.v);
+                        }
+                    }
+
+                    cJSON *b = cJSON_GetObjectItemCaseSensitive(led_item, "brightness");
+                    if (cJSON_IsNumber(b))
+                    {
+                        led_state.brightness = static_cast<uint8_t>(clamp_u(b->valueint, 0, 100));
+                    }
+
+                    cJSON *sp = cJSON_GetObjectItemCaseSensitive(led_item, "speed");
+                    if (cJSON_IsNumber(sp))
+                    {
+                        led_state.speed_ms = clamp_u(sp->valueint, 5, 5000);
+                    }
+
+                    cJSON *pix = cJSON_GetObjectItemCaseSensitive(led_item, "pixels");
+                    if (cJSON_IsArray(pix))
+                    {
+                        led_state.pixels.fill(-1);
+                        int wrote = 0;
+                        int n = cJSON_GetArraySize(pix);
+                        for (int i = 0; i < n && i < (int)LED_COUNT; i++)
+                        {
+                            cJSON *entry = cJSON_GetArrayItem(pix, i);
+                            if (cJSON_IsNull(entry))
+                            {
+                                continue;
+                            }
+                            led_color_t col = parse_led_color(entry);
+                            if (col.valid)
+                            {
+                                led_state.pixels[i] = ((int32_t)col.r << 16) | ((int32_t)col.g << 8) | (int32_t)col.b;
+                                wrote++;
+                            }
+                        }
+                        led_state.has_pixels = (wrote > 0);
+                    }
+
+                    ESP_LOGI("CONFIG", "Restored notification LED state object (active=%d, pattern=%s)",
+                             led_state.active, pattern_to_string(led_state.pattern));
+                }
+            }
+
+            cJSON_Delete(json);
+        }
+        free(json_buf);
+    }
+    else
+    {
+        fclose(f);
+        ESP_LOGE("CONFIG", "Heap allocation failed for reading config JSON text buffer.");
+    }
+}
+
+static esp_err_t example_get_sec2_salt(const char **salt, uint16_t *salt_len)
+{
+#if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
+	ESP_LOGI(TAG, "Development mode: using hard coded salt");
+	*salt = sec2_salt;
+	*salt_len = sizeof(sec2_salt);
+	return ESP_OK;
+#elif CONFIG_EXAMPLE_PROV_SEC2_PROD_MODE
+	ESP_LOGE(TAG, "Not implemented!");
+	return ESP_FAIL;
+#endif
+}
+
+static esp_err_t example_get_sec2_verifier(const char **verifier, uint16_t *verifier_len)
+{
+#if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
+	ESP_LOGI(TAG, "Development mode: using hard coded verifier");
+	*verifier = sec2_verifier;
+	*verifier_len = sizeof(sec2_verifier);
+	return ESP_OK;
+#elif CONFIG_EXAMPLE_PROV_SEC2_PROD_MODE
+	/* This code needs to be updated with appropriate implementation to provide verifier */
+	ESP_LOGE(TAG, "Not implemented!");
+	return ESP_FAIL;
+#endif
+}
+#endif
+
+static SemaphoreHandle_t lvgl_mux = NULL;
+
+#define BYTES_PER_PIXEL (LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565))
+#define BUFF_SIZE (EPD_WIDTH * EPD_HEIGHT * BYTES_PER_PIXEL)
+
+/*lvgl tset unlock*/
+static bool example_lvgl_lock(int timeout_ms);
+static void example_lvgl_unlock(void);
+static void example_lvgl_port_task(void *arg);
+static void wifi_prov_task(void *arg);
+#if 0
+static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
+{
+	uint16_t *buffer = (uint16_t *)color_p;
+	// driver->EPD_Clear();
+	for (int y = area->y1; y <= area->y2; y++)
+	{
+		for (int x = area->x1; x <= area->x2; x++)
+		{
+			uint8_t color = (*buffer < 0x7fff) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
+			driver->EPD_DrawColorPixel(x, y, color);
+			buffer++;
+		}
+	}
+	driver->EPD_DisplayPart();
+	lv_disp_flush_ready(disp);
+}
+#endif
+
+void ui_overlay_update_task(void *arg)
+{
+    ui_event_type_t incoming_event;
+
+    for (;;)
+    {
+        // Sleep indefinitely until a network event signals this queue
+        if (xQueueReceive(ui_event_queue, &incoming_event, portMAX_DELAY) == pdTRUE)
+        {
+            // Always lock LVGL before mutating any live widgets
+            if (example_lvgl_lock(-1))
+            {
+                if (wifi_status_icon != NULL)
+                {
+                    if (incoming_event == UI_WIFI_CONNECTED)
+                    {
+                        ESP_LOGI("UI_TASK", "Swapping icon source: WiFi Connected");
+                        lv_image_set_src(wifi_status_icon, &wifi); // Apply active icon
+                    }
+                    else if (incoming_event == UI_WIFI_DISCONNECTED)
+                    {
+                        ESP_LOGI("UI_TASK", "Swapping icon source: WiFi Disconnected");
+                        lv_image_set_src(wifi_status_icon, &wifi_no); // Apply warning icon
+                    }
+
+                    // Force the widget to render the fresh source map
+                    lv_obj_invalidate(wifi_status_icon);
+                }
+                example_lvgl_unlock(); // Always release the lock!
+            }
+        }
+    }
+}
+
+static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
+{
+	uint16_t *buffer = (uint16_t *)color_p;
+
+	// 1. Detect if LVGL is commanding a full-screen draw (0,0 to 199,199)
+	// or just a small, localized widget modification zone (like the Wi-Fi icon)
+	bool is_full_refresh = (area->x1 == 0 && area->y1 == 0 && area->x2 == 199 && area->y2 == 199);
+
+	if (is_full_refresh)
+	{
+		// Prime the controller for a FULL global blink cycle (prevents panel ghosting)
+		driver->EPD_Init();
+	}
+	else
+	{
+		// Prime the controller for a silent, ultra-fast PARTIAL update loop
+		driver->EPD_Init_Partial();
+	}
+
+	int black_pixels = 0;
+	int white_pixels = 0;
+
+	// This nested loop naturally handles partial frames because it only iterates 
+	// through the specific bounding box coordinates passed by the LVGL engine!
+	for (int y = area->y1; y <= area->y2; y++)
+	{
+		for (int x = area->x1; x <= area->x2; x++)
+		{
+			uint16_t rgb565 = *buffer;
+
+			uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;
+			uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;
+			uint8_t b = (rgb565 & 0x1F) << 3;
+
+			uint8_t brightness = (r * 77 + g * 150 + b * 29) >> 8;
+
+			uint8_t color = (brightness < 128) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
+			if (color == DRIVER_COLOR_BLACK)
+			{
+				black_pixels++;
+			}
+			else
+			{
+				white_pixels++;
+			}
+
+			driver->EPD_DrawColorPixel(x, y, color);
+			buffer++;
+		}
+	}
+
+	// 2. Commit the drawing data to the panel glass based on refresh type
+	if (is_full_refresh)
+	{
+		ESP_LOGI("FLUSH", "Executing Global Full Refresh -> Black: %d, White: %d", black_pixels, white_pixels);
+		driver->EPD_Display(); // Global flash refresh pass
+	}
+	else
+	{
+		ESP_LOGI("FLUSH", "Executing Silent Partial Refresh -> Black: %d, White: %d", black_pixels, white_pixels);
+		driver->EPD_DisplayPart(); // Quick localized ink migration
+	}
+
+	lv_disp_flush_ready(disp); //
+}
+
+static void example_increase_lvgl_tick(void *arg)
+{
+	lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
+}
+
+/* Signal Wi-Fi events on this event-group */
+const int WIFI_CONNECTED_EVENT = BIT0;
+static EventGroupHandle_t wifi_event_group;
+
+#define PROV_QR_VERSION "v1"
+#define PROV_TRANSPORT_SOFTAP "softap"
+#define PROV_TRANSPORT_BLE "ble"
+#define QRCODE_BASE_URL "https://espressif.github.io/esp-jumpstart/qrcode.html"
+
+/* Event handler for catching system events */
+
+// ── Firmware update (OTA) helpers ───────────────────────────────────
+
+static void publish_ota_event(const char *status, const char *detail)
+{
+	if (s_mqtt_client == nullptr)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_CreateObject();
+	if (root == nullptr)
+	{
+		return;
+	}
+	cJSON_AddStringToObject(root, "status", status);
+	if (detail != nullptr)
+	{
+		cJSON_AddStringToObject(root, "detail", detail);
+	}
+
+	char *payload = cJSON_Print(root);
+	if (payload != nullptr)
+	{
+		esp_mqtt_client_publish(s_mqtt_client, s_mqtt_evt_ota_topic, payload, 0, 1, 0);
+		free(payload);
+	}
+	cJSON_Delete(root);
+}
+
+// ── OTA intent handshake (shared NVS namespace with esp32_factory_app) ──
+//
+// The factory (bootloader) app must NEVER flash /sdcard/update.bin on its
+// own: it only flashes when this state says UPDATE_REQUESTED. The same
+// namespace is used to pass the outcome of an update cycle back to this app.
+
+#define OTA_NVS_NAMESPACE "ota"
+
+typedef enum {
+	OTA_STATE_NONE = 0,             // No cycle in progress
+	OTA_STATE_UPDATE_REQUESTED = 1, // App asked factory to flash update.bin
+	OTA_STATE_UPDATE_IN_PROGRESS = 2, // Factory is flashing
+	OTA_STATE_UPDATE_DONE = 3,      // Factory flashed new app successfully
+	OTA_STATE_UPDATE_FAILED = 4,    // Factory refused / aborted
+	OTA_STATE_UPDATE_RESTORED = 5,  // Backup restored after failed test
+} ota_state_t;
+
+typedef enum {
+	OTA_REASON_NONE = 0,
+	OTA_REASON_BAD_FILE = 1,
+	OTA_REASON_FLASH_FAILED = 2,
+	OTA_REASON_BACKUP_FAILED = 3,
+	OTA_REASON_NO_BACKUP = 4,
+} ota_fail_reason_t;
+
+static esp_err_t ota_nvs_state_set(uint8_t state, uint8_t reason)
+{
+	nvs_handle_t h;
+	esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &h);
+	if (err != ESP_OK)
+	{
+		return err;
+	}
+	err = nvs_set_u8(h, "state", state);
+	if (err == ESP_OK)
+	{
+		err = nvs_set_u8(h, "reason", reason);
+	}
+	if (err == ESP_OK)
+	{
+		err = nvs_commit(h);
+	}
+	nvs_close(h);
+	return err;
+}
+
+static esp_err_t ota_nvs_state_get(uint8_t *state, uint8_t *reason)
+{
+	*state = OTA_STATE_NONE;
+	*reason = OTA_REASON_NONE;
+
+	nvs_handle_t h;
+	esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &h);
+	if (err == ESP_ERR_NVS_NOT_FOUND)
+	{
+		return ESP_OK;
+	}
+	if (err != ESP_OK)
+	{
+		return err;
+	}
+	if (nvs_get_u8(h, "state", state) == ESP_OK)
+	{
+		/* read ok */
+	}
+	if (nvs_get_u8(h, "reason", reason) == ESP_OK)
+	{
+		/* read ok */
+	}
+	nvs_close(h);
+	return ESP_OK;
+}
+
+// Publish the pending OTA outcome (DONE / RESTORED / FAILED) once MQTT is up,
+// then clear the handshake back to NONE. Returns true if an event was sent.
+static bool ota_publish_pending_event(void)
+{
+	uint8_t state = OTA_STATE_NONE;
+	uint8_t reason = OTA_REASON_NONE;
+	ota_nvs_state_get(&state, &reason);
+
+	if (state == OTA_STATE_NONE)
+	{
+		return false;
+	}
+
+	const char *status = nullptr;
+	const char *detail = nullptr;
+	switch (state)
+	{
+	case OTA_STATE_UPDATE_DONE:
+		status = "update_success";
+		detail = "new firmware validated";
+		break;
+	case OTA_STATE_UPDATE_RESTORED:
+		status = "update_restored";
+		detail = "previous firmware restored after failed test";
+		break;
+	case OTA_STATE_UPDATE_FAILED:
+		status = "failed";
+		switch (reason)
+		{
+		case OTA_REASON_BAD_FILE: detail = "invalid update.bin"; break;
+		case OTA_REASON_FLASH_FAILED: detail = "flash failed"; break;
+		case OTA_REASON_BACKUP_FAILED: detail = "backup failed"; break;
+		case OTA_REASON_NO_BACKUP: detail = "no backup available"; break;
+		default: detail = "update failed"; break;
+		}
+		break;
+	case OTA_STATE_UPDATE_REQUESTED:
+	case OTA_STATE_UPDATE_IN_PROGRESS:
+	default:
+		status = "failed";
+		detail = "update aborted before completion";
+		break;
+	}
+
+	ota_nvs_state_set(OTA_STATE_NONE, OTA_REASON_NONE);
+	publish_ota_event(status, detail);
+	return true;
+}
+
+// Boot-time handling of the OTA handshake. Runs right after NVS init.
+//  - Marks the running app VALID on the first boot after an update (this is
+//    the "under test" confirmation: without it the bootloader reverts).
+//  - Clears stale REQUESTED / IN_PROGRESS states so a stale update.bin can
+//    never be flashed later.
+// Outcome events (DONE / RESTORED / FAILED) are deferred to MQTT connect so
+// they are not lost when the network is still down at boot.
+static void ota_handle_boot_state(void)
+{
+	// Only relevant when an otadata partition exists (Prod layout).
+	if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr) == nullptr)
+	{
+		return; // Dev build: no OTA, nothing to do.
+	}
+
+	uint8_t state = OTA_STATE_NONE;
+	uint8_t reason = OTA_REASON_NONE;
+	ota_nvs_state_get(&state, &reason);
+
+	const esp_partition_t *running_part = esp_ota_get_running_partition();
+	if (running_part != nullptr &&
+		running_part->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN &&
+		running_part->subtype <= ESP_PARTITION_SUBTYPE_APP_OTA_MAX)
+	{
+		esp_ota_img_states_t running_state = ESP_OTA_IMG_UNDEFINED;
+		if (esp_ota_get_state_partition(running_part, &running_state) == ESP_OK &&
+			running_state == ESP_OTA_IMG_PENDING_VERIFY)
+		{
+			ESP_LOGI(TAG, "OTA first boot detected (PENDING_VERIFY) - confirming app is valid.");
+			esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+			if (err != ESP_OK)
+			{
+				ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed (%s)", esp_err_to_name(err));
+			}
+		}
+	}
+
+	// A request that never reached the factory app must not linger: a later
+	// boot into factory could otherwise flash a stale update.bin.
+	if (state == OTA_STATE_UPDATE_REQUESTED || state == OTA_STATE_UPDATE_IN_PROGRESS)
+	{
+		ESP_LOGW(TAG, "OTA state %d was never completed by the factory app - clearing.", state);
+		ota_nvs_state_set(OTA_STATE_NONE, OTA_REASON_NONE);
+	}
+}
+
+static void show_update_in_progress(void)
+{
+	ESP_LOGI(TAG, "Showing 'Update in progress' on display");
+
+	if (example_lvgl_lock(-1))
+	{
+		lv_obj_t *scr = lv_screen_active();
+		lv_obj_clean(scr);
+
+		lv_obj_t *lbl = lv_label_create(scr);
+		lv_label_set_text(lbl, "Update in\nprogress");
+		lv_obj_set_style_text_font(lbl, LV_FONT_DEFAULT, 0);
+		lv_obj_center(lbl);
+
+		lv_obj_invalidate(scr);
+		lv_refr_now(lv_display_get_default());
+
+		example_lvgl_unlock();
+	}
+
+	// Give the e-paper time to finish the full refresh before rebooting.
+	vTaskDelay(pdMS_TO_TICKS(4000));
+}
+
+static void handle_firmware_update(const std::string &filepath)
+{
+	ESP_LOGI(TAG, "Firmware update download complete: %s", filepath.c_str());
+
+	// Locate the partition the bootloader app will flash (ota_0).
+	const esp_partition_t *ota0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+	if (ota0 == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: ota_0 partition not found!");
+		publish_ota_event("failed", "ota_0 partition missing");
+		return;
+	}
+
+	// Quick sanity check before committing to the update.
+	FILE *f = fopen(filepath.c_str(), "rb");
+	if (f == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: cannot open %s", filepath.c_str());
+		publish_ota_event("failed", "cannot open update file");
+		return;
+	}
+	fseek(f, 0, SEEK_END);
+	long file_size = ftell(f);
+	fclose(f);
+
+	if (file_size <= 0 || (size_t)file_size > ota0->size)
+	{
+		ESP_LOGE(TAG, "Firmware update: bad file size %ld (ota_0 max %u)", file_size, (unsigned)ota0->size);
+		publish_ota_event("failed", "bad update file size");
+		return;
+	}
+
+	// ESP-IDF app images start with the magic byte 0xE9.
+	f = fopen(filepath.c_str(), "rb");
+	if (f != nullptr)
+	{
+		uint8_t magic = 0;
+		if (fread(&magic, 1, 1, f) != 1 || magic != 0xE9)
+		{
+			ESP_LOGE(TAG, "Firmware update: not a valid ESP-IDF app image (magic 0x%02X)", magic);
+			fclose(f);
+			publish_ota_event("failed", "invalid firmware image");
+			return;
+		}
+		fclose(f);
+	}
+
+	ESP_LOGI(TAG, "Firmware update validated (%ld bytes). Showing update screen.", file_size);
+	publish_ota_event("downloaded", filepath.c_str());
+
+	show_update_in_progress();
+
+	// Point the ROM bootloader at the factory (bootloader) app.
+	const esp_partition_t *bootloader_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+	if (bootloader_part == nullptr)
+	{
+		ESP_LOGE(TAG, "Firmware update: factory partition not found!");
+		publish_ota_event("failed", "factory partition missing");
+		return;
+	}
+
+	// Record the update intent in NVS so the factory app flashes ONLY when an
+	// update was actually requested (never a stale /sdcard/update.bin).
+	esp_err_t nvs_err = ota_nvs_state_set(OTA_STATE_UPDATE_REQUESTED, OTA_REASON_NONE);
+	if (nvs_err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "Firmware update: failed to record update intent (%s)", esp_err_to_name(nvs_err));
+		publish_ota_event("failed", "cannot record update intent");
+		return;
+	}
+
+	esp_err_t err = esp_ota_set_boot_partition(bootloader_part);
+	if (err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "Firmware update: esp_ota_set_boot_partition failed (%s)", esp_err_to_name(err));
+		publish_ota_event("failed", esp_err_to_name(err));
+		return;
+	}
+
+	ESP_LOGI(TAG, "Firmware update: boot partition set to factory. Rebooting into bootloader.");
+	mqtt_logger_publish_direct(MQTT_LOG_INFO, TAG, "Firmware update ready. Rebooting into bootloader.");
+	publish_ota_event("rebooting", "bootloader");
+
+	vTaskDelay(pdMS_TO_TICKS(500));
+	esp_restart();
+}
+
+static void notify_download_handler(download_target_t target, bool success, const std::string &filepath)
+{
+	if (!success)
+	{
+		ESP_LOGE(TAG, "Failed to get file: %s", filepath.c_str());
+		return;
+	}
+
+	if (target == DOWNLOAD_TARGET_DISPLAY)
+	{
+		ESP_LOGI(TAG, "Updating display state with new data path: %s", filepath.c_str());
+		{
+			std::lock_guard<std::mutex> lock(display_state.mutex);
+			display_state.data_path = filepath;
+			display_state.active = true;
+		}
+		save_settings_to_json();
+		if (display_task_handle != NULL)
+		{
+			ESP_LOGI(TAG, "Notifying display task of new data path: %s", filepath.c_str());
+			xTaskNotifyGive(display_task_handle);
+		}
+	}
+	else if (target == DOWNLOAD_TARGET_AUDIO)
+	{
+		ESP_LOGI(TAG, "Updating audio state with new file: %s", filepath.c_str());
+		std::string filename = filepath;
+		size_t slash = filename.rfind('/');
+		if (slash != std::string::npos)
+		{
+			filename = filename.substr(slash + 1);
+		}
+		{
+			std::lock_guard<std::mutex> lock(audio_state.mutex);
+			strncpy(audio_state.filename, filename.c_str(), sizeof(audio_state.filename) - 1);
+			audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
+			audio_state.active = true;
+		}
+		if (audio_task_handle != NULL)
+		{
+			ESP_LOGI(TAG, "Notifying audio task of new file: %s", audio_state.filename);
+			xTaskNotifyGive(audio_task_handle);
+		}
+	}
+	else if (target == DOWNLOAD_TARGET_FIRMWARE)
+	{
+		handle_firmware_update(filepath);
+	}
+}
+
+static void download_orchestrator_task(void *arg)
+{
+	ESP_LOGI(TAG, "Download Orchestrator Task Started");
+
+	AsyncDownloader downloader;
+	DownloadCommand_t incoming_cmd;
+
+	for (;;)
+	{
+		// Block indefinitely until a command arrives in the queue
+		if (xQueueReceive(download_cmd_queue, &incoming_cmd, portMAX_DELAY) == pdTRUE)
+		{
+			ESP_LOGI(TAG, "Orchestrator received request: URL=%s, Target=%s",
+					 incoming_cmd.url, incoming_cmd.filename);
+
+			// Convert standard C arrays to std::string for the C++ class
+			std::string urlStr(incoming_cmd.url);
+			std::string fileStr("/sdcard/" + std::string(incoming_cmd.filename));
+
+			if (sdcard == nullptr || !sdcard->isMounted())
+			{
+				ESP_LOGE(TAG, "Cannot get %s: SD card is unavailable", incoming_cmd.filename);
+				continue;
+			}
+
+			download_target_t dl_target = incoming_cmd.target;
+			if (sdcard->fileExists(incoming_cmd.filename))
+			{
+				ESP_LOGI(TAG, "File already available at: %s", fileStr.c_str());
+				notify_download_handler(dl_target, true, fileStr);
+				continue;
+			}
+
+			log_heap_info("orchestrator before startDownload");
+		ESP_LOGI(TAG, "%s not found. Starting download", fileStr.c_str());
+		if (!downloader.startDownload(urlStr, fileStr, [dl_target](bool success, const std::string &filepath)
+			{
+				notify_download_handler(dl_target, success, filepath);
+			}))
+		{
+			ESP_LOGE(TAG, "Failed to start download for file: %s", fileStr.c_str());
+		}
+
+			// Note: startDownload spawns its own FreeRTOS tasks and returns immediately.
+			// If you only want one download at a time, you may need to add logic here
+			// to wait until the downloader signals completion before accepting the next queue item.
+		}
+	}
+}
+static void event_handler(void *arg, esp_event_base_t event_base,
+						  int32_t event_id, void *event_data)
+{
+	if (event_base == NETWORK_PROV_EVENT)
+	{
+		switch (event_id)
+		{
+		case NETWORK_PROV_START:
+			ESP_LOGI(TAG, "Provisioning started");
+			s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_PROVISIONING);
+			break;
+		case NETWORK_PROV_WIFI_CRED_RECV:
+		{
+			wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+			ESP_LOGI(TAG, "Received Wi-Fi credentials"
+						  "\n\tSSID     : %s\n\tPassword : %s",
+					 (const char *)wifi_sta_cfg->ssid,
+					 (const char *)wifi_sta_cfg->password);
+			break;
+		}
+		case NETWORK_PROV_WIFI_CRED_FAIL:
+		{
+			network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
+			ESP_LOGE(TAG, "Provisioning failed!\n\tReason : %s"
+						  "\n\tPlease reset to factory and retry provisioning",
+					 (*reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR) ? "Wi-Fi station authentication failed" : "Wi-Fi access-point not found");
+#ifdef CONFIG_EXAMPLE_RESET_PROV_MGR_ON_FAILURE
+			/* Reset the state machine on provisioning failure.
+			 * This is enabled by the CONFIG_EXAMPLE_RESET_PROV_MGR_ON_FAILURE configuration.
+			 * It allows the provisioning manager to retry the provisioning process
+			 * based on the number of attempts specified in wifi_conn_attempts. After attempting
+			 * the maximum number of retries, the provisioning manager will reset the state machine
+			 * and the provisioning process will be terminated.
+			 */
+			network_prov_mgr_reset_wifi_sm_state_on_failure();
+#endif
+			break;
+		}
+		case NETWORK_PROV_WIFI_CRED_SUCCESS:
+			ESP_LOGI(TAG, "Provisioning successful");
+			break;
+		case NETWORK_PROV_END:
+		{
+			/* De-initialize manager once provisioning is finished */
+			esp_err_t err = network_prov_mgr_deinit();
+			if (err != ESP_OK)
+			{
+				ESP_LOGE(TAG, "Failed to de-initialize provisioning manager: %s", esp_err_to_name(err));
+			}
+
+			// Clean up the binary image widget & its PSRAM allocation buffer
+            if (example_lvgl_lock(-1))
+            {
+                if (qr_image_obj != NULL)
+                {
+                    lv_obj_delete(qr_image_obj);
+                    qr_image_obj = NULL;
+                }
+                if (qr_pixel_buffer != NULL)
+                {
+                    heap_caps_free(qr_pixel_buffer);
+                    qr_pixel_buffer = NULL;
+                }
+                lv_obj_invalidate(lv_screen_active());
+                example_lvgl_unlock();
+            }
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	else if (event_base == WIFI_EVENT)
+	{
+		switch (event_id)
+		{
+		case WIFI_EVENT_STA_START:
+			esp_wifi_connect();
+			break;
+		case WIFI_EVENT_STA_DISCONNECTED:
+			{
+				ESP_LOGI(TAG, "Disconnected. Connecting to the AP again...");
+				if (UI_WIFI_CONNECTED == wifi_status)
+				{
+					wifi_status = ui_event_type_t::UI_WIFI_DISCONNECTED;
+					if (ui_event_queue) {
+					xQueueSend(ui_event_queue, &wifi_status, 0);
+					}
+				}
+
+				esp_wifi_connect();
+			}
+			break;
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
+		case WIFI_EVENT_AP_STACONNECTED:
+			ESP_LOGI(TAG, "SoftAP transport: Connected!");
+			break;
+		case WIFI_EVENT_AP_STADISCONNECTED:
+			ESP_LOGI(TAG, "SoftAP transport: Disconnected!");
+			break;
+#endif
+		default:
+			break;
+		}
+	}
+	else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+	{
+		ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+		ESP_LOGI(TAG, "Connected with IP Address:" IPSTR, IP2STR(&event->ip_info.ip));
+
+		if (UI_WIFI_CONNECTED != wifi_status)
+		{
+			wifi_status = ui_event_type_t::UI_WIFI_CONNECTED;
+			if (ui_event_queue) {
+				xQueueSend(ui_event_queue, &wifi_status, 0);
+			}
+		}
+
+		/* Signal main application to continue execution */
+		xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+		s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_WIFI_CONNECTED);
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+	}
+	else if (event_base == PROTOCOMM_TRANSPORT_BLE_EVENT)
+	{
+		switch (event_id)
+		{
+		case PROTOCOMM_TRANSPORT_BLE_CONNECTED:
+			ESP_LOGI(TAG, "BLE transport: Connected!");
+			s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_BLE_CONNECTED);
+			break;
+		case PROTOCOMM_TRANSPORT_BLE_DISCONNECTED:
+			ESP_LOGI(TAG, "BLE transport: Disconnected!");
+			break;
+		default:
+			break;
+		}
+#endif
+	}
+	else if (event_base == PROTOCOMM_SECURITY_SESSION_EVENT)
+	{
+		switch (event_id)
+		{
+		case PROTOCOMM_SECURITY_SESSION_SETUP_OK:
+			ESP_LOGI(TAG, "Secured session established!");
+			break;
+		case PROTOCOMM_SECURITY_SESSION_INVALID_SECURITY_PARAMS:
+			ESP_LOGE(TAG, "Received invalid security parameters for establishing secure session!");
+			break;
+		case PROTOCOMM_SECURITY_SESSION_CREDENTIALS_MISMATCH:
+			ESP_LOGE(TAG, "Received incorrect username and/or PoP for establishing secure session!");
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+// ── MQTT command dispatch table (topic -> handler) ─────────────────
+
+static void handle_display_command(const char *payload);
+static void handle_rgb_command(const char *payload);
+static void handle_audio_command(const char *payload);
+static void handle_notification_command(const char *payload);
+static void handle_ota_command(const char *payload);
+
+static std::map<std::string, std::function<void(const char *)>> s_cmd_dispatch;
+
+static void mqtt_dispatch_init(void)
+{
+	s_cmd_dispatch[s_mqtt_cmd_log_topic] = mqtt_logger_handle_command;
+	s_cmd_dispatch[s_mqtt_cmd_display_topic] = handle_display_command;
+	s_cmd_dispatch[s_mqtt_cmd_rgb_topic] = handle_rgb_command;
+	s_cmd_dispatch[s_mqtt_cmd_audio_topic] = handle_audio_command;
+	s_cmd_dispatch[s_mqtt_cmd_notification_topic] = handle_notification_command;
+	s_cmd_dispatch[s_mqtt_cmd_ota_topic] = handle_ota_command;
+}
+
+/*
+ * @brief Event handler registered to receive MQTT events
+ *
+ *  This function is called by the MQTT client event loop.
+ *
+ * @param handler_args user data registered to the event.
+ * @param base Event base for the handler(always MQTT Base in this example).
+ * @param event_id The id for the received event.
+ * @param event_data The data for the event, esp_mqtt_event_handle_t.
+ */
+static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+	ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
+	esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+	esp_mqtt_client_handle_t client = event->client;
+	int msg_id;
+
+	ESP_LOGD(TAG, "free heap size is %" PRIu32 ", minimum %" PRIu32, esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+	switch ((esp_mqtt_event_id_t)event_id)
+	{
+	case MQTT_EVENT_CONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+		s_mqtt_client = client;
+
+		// Subscribe to per-device command topics
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_display_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_display_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_rgb_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_rgb_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_audio_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_audio_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_notification_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_notification_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_log_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_log_topic, msg_id);
+		msg_id = esp_mqtt_client_subscribe(client, s_mqtt_cmd_ota_topic, 1);
+		ESP_LOGI(TAG, "subscribed to %s, msg_id=%d", s_mqtt_cmd_ota_topic, msg_id);
+
+		// Legacy topic for backward compatibility
+		msg_id = esp_mqtt_client_subscribe(client, CONFIG_COMMAND_TOPIC, 2);
+		ESP_LOGI(TAG, "subscribed to legacy %s, msg_id=%d", CONFIG_COMMAND_TOPIC, msg_id);
+
+		// Initialise MQTT logger
+		mqtt_logger_init(client, s_device_id, MQTT_LOG_INFO, 16);
+
+		// Report any OTA cycle that completed while the network was down.
+		ota_publish_pending_event();
+
+// App is fully up: hand the notification LED back to MQTT control.
+		s_led_prov_state.store(led_prov_state_t::LED_PROV_STATE_NONE);
+
+		// Publish the canonical LED state (retained) for broker/integrator sync.
+		publish_led_event();
+		break;
+	case MQTT_EVENT_DISCONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+		break;
+	case MQTT_EVENT_SUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_UNSUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_PUBLISHED:
+		ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_DATA:
+	{
+		ESP_LOGD(TAG, "MQTT_EVENT_DATA");
+		ESP_LOGD(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+
+		// Ensure the payload is null-terminated for parsing
+		char *payload = (char *)malloc(event->data_len + 1);
+		if (payload == NULL)
+		{
+			ESP_LOGE(TAG, "Failed to allocate memory for payload");
+			return;
+		}
+
+		memcpy(payload, event->data, event->data_len);
+		payload[event->data_len] = '\0';
+
+		// ── Topic-based dispatch via lookup table ────────────────────────
+		std::string topic(event->topic, event->topic_len);
+		auto it = s_cmd_dispatch.find(topic);
+		if (it != s_cmd_dispatch.end())
+		{
+			it->second(payload);
+		}
+		else
+		{
+			ESP_LOGW(TAG, "No handler for topic: %.*s", event->topic_len, event->topic);
+		}
+
+		free(payload);
+	}
+	break;
+	case MQTT_EVENT_ERROR:
+		ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+		ESP_LOGI(TAG, "MQTT5 return code is %d", event->error_handle->connect_return_code);
+		break;
+	case MQTT_EVENT_BEFORE_CONNECT:
+	case MQTT_EVENT_DELETED:
+	case MQTT_EVENT_ANY:
+	case MQTT_USER_EVENT:
+	default:
+		ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+		break;
+	}
+}
+
+static void mqtt5_app_start(void)
+{
+	esp_mqtt_client_config_t mqtt5_cfg = {};
+	mqtt5_cfg.broker.address.uri = CONFIG_BROKER_URL;
+	// mqtt5_cfg.credentials.username = "123";
+	// mqtt5_cfg.credentials.authentication.password = "456";
+	mqtt5_cfg.session.last_will.topic = "/topic/will";
+	mqtt5_cfg.session.last_will.msg = "i will leave";
+	mqtt5_cfg.session.last_will.msg_len = 12;
+	mqtt5_cfg.session.last_will.qos = 1;
+	mqtt5_cfg.session.last_will.retain = true;
+	mqtt5_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+
+	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
+	s_mqtt_client = client;
+
+	/* TODO: Remove commented lines of code*/
+	/* Set connection properties and user properties */
+	// esp_mqtt5_client_set_user_property(&connect_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+	// esp_mqtt5_client_set_user_property(&connect_property.will_user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+	// esp_mqtt5_client_set_connect_property(client, &connect_property);
+
+	/* If you call esp_mqtt5_client_set_user_property to set user properties, DO NOT forget to delete them.
+	 * esp_mqtt5_client_set_connect_property will malloc buffer to store the user_property and you can delete it after
+	 */
+	// esp_mqtt5_client_delete_user_property(connect_property.user_property);
+	// esp_mqtt5_client_delete_user_property(connect_property.will_user_property);
+
+	/* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+	esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt5_event_handler, NULL);
+	esp_mqtt_client_start(client);
+}
+
+static void wifi_init_sta(void)
+{
+	/* Start Wi-Fi in station mode */
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void get_device_service_name(char *service_name, size_t max)
+{
+	uint8_t eth_mac[6];
+	const char *ssid_prefix = "PROV_";
+	esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
+	snprintf(service_name, max, "%s%02X%02X%02X",
+			 ssid_prefix, eth_mac[3], eth_mac[4], eth_mac[5]);
+}
+
+/* Handler for the optional provisioning endpoint registered by the application.
+ * The data format can be chosen by applications. Here, we are using plain ascii text.
+ * Applications can choose to use other formats like protobuf, JSON, XML, etc.
+ * Note that memory for the response buffer must be allocated using heap as this buffer
+ * gets freed by the protocomm layer once it has been sent by the transport layer.
+ */
+esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen,
+								   uint8_t **outbuf, ssize_t *outlen, void *priv_data)
+{
+	if (inbuf)
+	{
+		ESP_LOGI(TAG, "Received data: %.*s", inlen, (char *)inbuf);
+	}
+	char response[] = "SUCCESS";
+	*outbuf = (uint8_t *)strdup(response);
+	if (*outbuf == NULL)
+	{
+		ESP_LOGE(TAG, "System out of memory");
+		return ESP_ERR_NO_MEM;
+	}
+	*outlen = strlen(response) + 1; /* +1 for NULL terminating byte */
+
+	return ESP_OK;
+}
+
+// ==========================================================
+// 7. Core Binary UI QR Generation Logic (No Canvas Needed)
+// ==========================================================
+static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
+    int qr_size = esp_qrcode_get_size(qrcode);
+    const int display_dim = 200; 
+
+    int scale = display_dim / qr_size;
+    if (scale < 1) scale = 1;
+
+    int offset_x = (display_dim - (qr_size * scale)) / 2;
+    int offset_y = (display_dim - (qr_size * scale)) / 2;
+
+    const size_t RGB565_SIZE = display_dim * display_dim * 2; 
+
+    if (qr_pixel_buffer == NULL) {
+        qr_pixel_buffer = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
+    }
+
+    if (qr_pixel_buffer == NULL) {
+        ESP_LOGE("QR_UI", "External frame allocation breakdown for QR matrix layer!");
+        return;
+    }
+
+    uint16_t *rgb565_dest = (uint16_t *)qr_pixel_buffer;
+    for (int i = 0; i < (display_dim * display_dim); i++) {
+        rgb565_dest[i] = 0xFFFF; // Clear canvas background to complete white
+    }
+
+    for (int y = 0; y < qr_size; y++) {
+        for (int x = 0; x < qr_size; x++) {
+            if (esp_qrcode_get_module(qrcode, x, y)) {
+                for (int py = 0; py < scale; py++) {
+                    for (int px = 0; px < scale; px++) {
+                        int target_x = offset_x + (x * scale) + px;
+                        int target_y = offset_y + (y * scale) + py;
+                        if (target_x >= 0 && target_x < display_dim && target_y >= 0 && target_y < display_dim) {
+                            rgb565_dest[target_y * display_dim + target_x] = 0x0000; // Map black module bits
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    qr_dynamic_bmp.header.magic = LV_IMAGE_HEADER_MAGIC;
+    qr_dynamic_bmp.header.cf = LV_COLOR_FORMAT_RGB565;
+    qr_dynamic_bmp.header.flags = 0;
+    qr_dynamic_bmp.header.w = display_dim;
+    qr_dynamic_bmp.header.h = display_dim;
+    qr_dynamic_bmp.header.stride = display_dim * 2;
+    qr_dynamic_bmp.header.reserved_2 = 0;
+    qr_dynamic_bmp.data_size = RGB565_SIZE;
+    qr_dynamic_bmp.data = qr_pixel_buffer;
+
+    if (example_lvgl_lock(-1)) {
+        if (qr_image_obj == NULL) {
+            qr_image_obj = lv_image_create(lv_screen_active());
+        }
+        
+        lv_image_set_src(qr_image_obj, NULL); 
+        lv_image_set_src(qr_image_obj, &qr_dynamic_bmp);
+        lv_obj_center(qr_image_obj);
+        lv_obj_move_foreground(qr_image_obj);
+        lv_obj_clear_flag(qr_image_obj, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(qr_image_obj);
+        
+        example_lvgl_unlock();
+        ESP_LOGI("QR_UI", "Successfully pushed binary QR image payload onto layout engine matrix.");
+    }
+}
+
+static void wifi_prov_print_qr(const char *name, const char *username, const char *pop, const char *transport)
+{
+	if (!name || !transport)
+	{
+		ESP_LOGW(TAG, "Cannot generate QR code payload. Data missing.");
+		return;
+	}
+	char payload[150] = {0};
+	if (pop)
+	{
+#if CONFIG_EXAMPLE_PROV_SECURITY_VERSION_1
+		snprintf(payload, sizeof(payload), "{\"ver\":\"%s\",\"name\":\"%s\""
+										   ",\"pop\":\"%s\",\"transport\":\"%s\"}",
+				 PROV_QR_VERSION, name, pop, transport);
+#elif CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
+		snprintf(payload, sizeof(payload), "{\"ver\":\"%s\",\"name\":\"%s\""
+										   ",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\"}",
+				 PROV_QR_VERSION, name, username, pop, transport);
+#endif
+	}
+	else
+	{
+		snprintf(payload, sizeof(payload), "{\"ver\":\"%s\",\"name\":\"%s\""
+										   ",\"transport\":\"%s\",\"network\":\"wifi\"}",
+				 PROV_QR_VERSION, name, transport);
+	}
+
+	ESP_LOGI(TAG, "Scan this QR code from the provisioning application for Provisioning.");
+	esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+	cfg.display_func = qr_code_lvgl_display_cb;
+	esp_qrcode_generate(&cfg, payload);
+	ESP_LOGI(TAG, "If QR code is not visible, copy paste the below URL in a browser.\n%s?data=%s", QRCODE_BASE_URL, payload);
+}
+
+#ifdef CONFIG_EXAMPLE_PROV_ENABLE_APP_CALLBACK
+void wifi_prov_app_callback(void *user_data, wifi_prov_cb_event_t event, void *event_data)
+{
+	/**
+	 * This is blocking callback, any configurations that needs to be set when a particular
+	 * provisioning event is triggered can be set here.
+	 */
+	switch (event)
+	{
+	case WIFI_PROV_SET_STA_CONFIG:
+	{
+		/**
+		 * Wi-Fi configurations can be set here before the Wi-Fi is enabled in
+		 * STA mode.
+		 */
+		wifi_config_t *wifi_config = (wifi_config_t *)event_data;
+		(void)wifi_config;
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+const wifi_prov_event_handler_t wifi_prov_event_handler = {
+	.event_cb = wifi_prov_app_callback,
+	.user_data = NULL,
+};
+#endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
+
+bool get_notification_state()
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	return led_state.active;
+}
+
+void set_notification_state(bool state)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	led_state.active = state;
+}
+
+void set_notification_message(const std::string &message)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	strncpy(led_state.pattern_name, message.c_str(), sizeof(led_state.pattern_name) - 1);
+	led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+	led_state.pattern = pattern_from_string(message);
+}
+
+std::string get_notification_message()
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	return std::string(led_state.pattern_name);
+}
+
+// ── Per-topic MQTT command handlers ────────────────────────────────
+
+static void handle_display_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Display command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Display: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *filename = cJSON_GetObjectItemCaseSensitive(json, "filename");
+
+	if (!cJSON_IsString(download) || !cJSON_IsString(filename)) {
+		ESP_LOGW(TAG, "Display command missing 'download' or 'filename'");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Display download: %s -> %s", download->valuestring, filename->valuestring);
+	log_heap_info("handle_display_command");
+
+	// Enqueue download if URL is present
+	if (download->valuestring[0] == 'h') {
+		DownloadCommand_t cmd;
+		memset(&cmd, 0, sizeof(DownloadCommand_t));
+		strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+		strncpy(cmd.filename, filename->valuestring, MAX_FILE_LEN - 1);
+		cmd.target = DOWNLOAD_TARGET_DISPLAY;
+
+		if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+			ESP_LOGE(TAG, "Display: download queue full, dropping command");
+		}
+	}
+
+	// Set display state
+	{
+		std::lock_guard<std::mutex> lock(display_state.mutex);
+		display_state.active = true;
+		display_state.data_path = "/sdcard/" + std::string(filename->valuestring);
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_rgb_command(const char *payload)
+{
+	ESP_LOGI(TAG, "RGB command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "RGB: invalid JSON");
+		return;
+	}
+
+	bool has_any = false;
+	bool persist = true;
+
+	cJSON *enable = cJSON_GetObjectItemCaseSensitive(json, "enable");
+	cJSON *pattern = cJSON_GetObjectItemCaseSensitive(json, "pattern");
+	cJSON *color = cJSON_GetObjectItemCaseSensitive(json, "color");
+	cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
+	cJSON *speed = cJSON_GetObjectItemCaseSensitive(json, "speed");
+	cJSON *duration = cJSON_GetObjectItemCaseSensitive(json, "duration");
+	cJSON *pixels = cJSON_GetObjectItemCaseSensitive(json, "pixels");
+	cJSON *persist_item = cJSON_GetObjectItemCaseSensitive(json, "persist");
+
+	if (cJSON_IsBool(persist_item))
+	{
+		persist = cJSON_IsTrue(persist_item);
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(led_state.mutex);
+
+		if (cJSON_IsBool(enable))
+		{
+			led_state.active = cJSON_IsTrue(enable);
+			has_any = true;
+		}
+
+		if (cJSON_IsString(pattern) && pattern->valuestring != NULL)
+		{
+			led_state.pattern = pattern_from_string(pattern->valuestring);
+			strncpy(led_state.pattern_name, pattern->valuestring, sizeof(led_state.pattern_name) - 1);
+			led_state.pattern_name[sizeof(led_state.pattern_name) - 1] = '\0';
+			has_any = true;
+			if (!cJSON_IsBool(enable))
+			{
+				led_state.active = true;
+			}
+		}
+
+		if (color != nullptr && !cJSON_IsNull(color))
+		{
+			led_color_t c = parse_led_color(color);
+			if (c.valid)
+			{
+				led_state.hue = static_cast<uint16_t>(c.h);
+				led_state.saturation = static_cast<uint8_t>(c.s);
+				led_state.value = static_cast<uint8_t>(c.v);
+				has_any = true;
+			}
+			else
+			{
+				ESP_LOGW(TAG, "RGB: invalid 'color' value");
+			}
+		}
+
+		if (cJSON_IsNumber(brightness))
+		{
+			led_state.brightness = static_cast<uint8_t>(clamp_u(brightness->valueint, 0, 100));
+			has_any = true;
+		}
+
+		if (cJSON_IsNumber(speed))
+		{
+			led_state.speed_ms = clamp_u(speed->valueint, 5, 5000);
+			has_any = true;
+		}
+
+		if (cJSON_IsNumber(duration))
+		{
+			if (duration->valueint <= 0)
+			{
+				led_state.duration_ms = 0;
+			}
+			else
+			{
+				led_state.duration_ms = clamp_u(duration->valueint, 1, 3600) * 1000U;
+			}
+			led_state.set_at_ms = esp_timer_get_time() / 1000;
+			has_any = true;
+		}
+
+		if (cJSON_IsArray(pixels))
+		{
+			int n = cJSON_GetArraySize(pixels);
+			if (n > 0)
+			{
+				led_state.pixels.fill(-1);
+				int wrote = 0;
+				for (int i = 0; i < n && i < (int)LED_COUNT; i++)
+				{
+					cJSON *entry = cJSON_GetArrayItem(pixels, i);
+					if (cJSON_IsNull(entry))
+					{
+						continue;
+					}
+					led_color_t c = parse_led_color(entry);
+					if (c.valid)
+					{
+						led_state.pixels[i] = ((int32_t)c.r << 16) | ((int32_t)c.g << 8) | (int32_t)c.b;
+						wrote++;
+					}
+				}
+				led_state.has_pixels = (wrote > 0);
+				has_any = true;
+			}
+		}
+
+		if (has_any)
+		{
+			led_state.cmd_id = ++s_led_cmd_seq;
+		}
+	}
+
+	if (!has_any)
+	{
+		ESP_LOGW(TAG, "RGB command missing valid fields");
+		cJSON_Delete(json);
+		return;
+	}
+
+	if (persist)
+	{
+		save_settings_to_json();
+	}
+	publish_led_event();
+
+	cJSON_Delete(json);
+}
+
+static void handle_audio_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Audio command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Audio: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *filename = cJSON_GetObjectItemCaseSensitive(json, "filename");
+	cJSON *volume = cJSON_GetObjectItemCaseSensitive(json, "volume");
+
+	if (!cJSON_IsString(download) || !cJSON_IsString(filename)) {
+		ESP_LOGW(TAG, "Audio command missing 'download' or 'filename'");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Audio download: %s -> %s", download->valuestring, filename->valuestring);
+
+	if (cJSON_IsNumber(volume)) {
+		std::lock_guard<std::mutex> lock(audio_state.mutex);
+		audio_state.volume = (uint8_t)volume->valueint;
+	}
+
+	// Enqueue download if URL is present
+	if (download->valuestring[0] == 'h') {
+		DownloadCommand_t cmd;
+		memset(&cmd, 0, sizeof(DownloadCommand_t));
+		strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+		strncpy(cmd.filename, filename->valuestring, MAX_FILE_LEN - 1);
+		cmd.target = DOWNLOAD_TARGET_AUDIO;
+
+		if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+			ESP_LOGE(TAG, "Audio: download queue full, dropping command");
+		}
+	} else {
+		// No download URL — file already on SD card, play directly
+		std::lock_guard<std::mutex> lock(audio_state.mutex);
+		strncpy(audio_state.filename, filename->valuestring, sizeof(audio_state.filename) - 1);
+		audio_state.filename[sizeof(audio_state.filename) - 1] = '\0';
+		audio_state.active = true;
+
+		if (audio_task_handle != NULL) {
+			xTaskNotifyGive(audio_task_handle);
+		}
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_notification_command(const char *payload)
+{
+	ESP_LOGI(TAG, "Notification command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "Notification: invalid JSON");
+		return;
+	}
+
+	cJSON *message = cJSON_GetObjectItemCaseSensitive(json, "message");
+	if (cJSON_IsString(message) && message->valuestring != NULL) {
+		ESP_LOGI(TAG, "Notification message: %s", message->valuestring);
+		set_notification_message(std::string(message->valuestring));
+		set_notification_state(true);
+	} else {
+		ESP_LOGW(TAG, "Notification command missing valid 'message' field");
+	}
+
+	cJSON_Delete(json);
+}
+
+static void handle_ota_command(const char *payload)
+{
+	ESP_LOGI(TAG, "OTA command received");
+
+	cJSON *json = cJSON_Parse(payload);
+	if (!json) {
+		ESP_LOGE(TAG, "OTA: invalid JSON");
+		return;
+	}
+
+	cJSON *download = cJSON_GetObjectItemCaseSensitive(json, "download");
+	cJSON *version = cJSON_GetObjectItemCaseSensitive(json, "version");
+
+	if (!cJSON_IsString(download) || download->valuestring == NULL) {
+		ESP_LOGW(TAG, "OTA command missing valid 'download' URL");
+		cJSON_Delete(json);
+		return;
+	}
+
+	ESP_LOGI(TAG, "OTA firmware: %s (version=%s)",
+			 download->valuestring,
+			 (cJSON_IsString(version) && version->valuestring != NULL) ? version->valuestring : "?");
+
+	publish_ota_event("started", download->valuestring);
+
+	// Reuse the bootloader app's fixed filename on the SD card.
+	if (sdcard != nullptr && sdcard->isMounted() && sdcard->fileExists("update.bin"))
+	{
+		sdcard->deleteFile("update.bin");
+	}
+
+	DownloadCommand_t cmd;
+	memset(&cmd, 0, sizeof(DownloadCommand_t));
+	strncpy(cmd.url, download->valuestring, MAX_URL_LEN - 1);
+	strncpy(cmd.filename, "update.bin", sizeof(cmd.filename) - 1);
+	cmd.target = DOWNLOAD_TARGET_FIRMWARE;
+
+	if (xQueueSend(download_cmd_queue, &cmd, 0) != pdPASS) {
+		ESP_LOGE(TAG, "OTA: download queue full, dropping command");
+		publish_ota_event("failed", "queue full");
+	}
+
+	cJSON_Delete(json);
+}
+
+// ── Audio playback task ───────────────────────────────────────────
+
+static void audio_playback_task(void *arg)
+{
+	ESP_LOGI(TAG, "Audio playback task started");
+
+	audio_bsp_init();
+	esp_codec_dev_sample_info_t fs = {};
+	fs.sample_rate = 16000;
+	fs.channel = 2;
+	fs.bits_per_sample = 16;
+	esp_codec_dev_handle_t playback = get_playback_handle();
+
+	for (;;)
+	{
+		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+
+		bool should_play = false;
+		char filename[64] = {0};
+		uint8_t volume = 80;
+		{
+			std::lock_guard<std::mutex> lock(audio_state.mutex);
+			if (audio_state.active)
+			{
+				should_play = true;
+				strncpy(filename, audio_state.filename, sizeof(filename) - 1);
+				volume = audio_state.volume;
+				audio_state.active = false;
+			}
+		}
+
+		if (!should_play)
+			continue;
+
+		ESP_LOGI(TAG, "Audio play: %s (vol=%d)", filename, volume);
+		esp_codec_dev_set_out_vol(playback, (float)volume);
+
+		if (strcmp(filename, "boot") == 0)
+		{
+			extern const uint8_t music_pcm_start[] asm("_binary_canon_pcm_start");
+			extern const uint8_t music_pcm_end[]   asm("_binary_canon_pcm_end");
+			size_t pcm_size = music_pcm_end - music_pcm_start;
+			uint8_t *pcm_ptr = (uint8_t *)music_pcm_start;
+
+			if (esp_codec_dev_open(playback, &fs) == ESP_CODEC_DEV_OK)
+			{
+				size_t written = 0;
+				while (written < pcm_size)
+				{
+					esp_codec_dev_write(playback, pcm_ptr + written, 256);
+					written += 256;
+				}
+			}
+			esp_codec_dev_close(playback);
+			ESP_LOGI(TAG, "Boot sound playback complete");
+		}
+		else
+		{
+			std::string file_path = "/sdcard/" + std::string(filename);
+			FILE *f = fopen(file_path.c_str(), "rb");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Audio: cannot open %s", file_path.c_str());
+				continue;
+			}
+
+			if (esp_codec_dev_open(playback, &fs) == ESP_CODEC_DEV_OK)
+			{
+				uint8_t buf[1024];
+				size_t bytes_read;
+				while ((bytes_read = fread(buf, 1, sizeof(buf), f)) > 0)
+				{
+					esp_codec_dev_write(playback, buf, bytes_read);
+				}
+			}
+			esp_codec_dev_close(playback);
+			fclose(f);
+			ESP_LOGI(TAG, "Audio file playback complete: %s", file_path.c_str());
+		}
+	}
+}
+
+static void audio_boot_task(void *arg)
+{
+	ESP_LOGI(TAG, "Playing boot sound...");
+	vTaskDelay(pdMS_TO_TICKS(500));
+
+	audio_bsp_init();
+	audio_play_init();
+
+	extern const uint8_t music_pcm_start[] asm("_binary_canon_pcm_start");
+	extern const uint8_t music_pcm_end[]   asm("_binary_canon_pcm_end");
+	size_t pcm_size = music_pcm_end - music_pcm_start;
+	uint8_t *pcm_ptr = (uint8_t *)music_pcm_start;
+	size_t written = 0;
+	while (written < pcm_size)
+	{
+		esp_codec_dev_write(get_playback_handle(), pcm_ptr + written, 256);
+		written += 256;
+	}
+	ESP_LOGI(TAG, "Boot sound complete");
+	vTaskDelete(NULL);
+}
+
+void led_test_task(void *arg)
+{
+	RgbLedStrip<LED_COUNT> led_strip(RMT_LED_STRIP_GPIO_NUM);
+	uint32_t phase = 0;
+	uint64_t last_frame_ms = esp_timer_get_time() / 1000;
+	uint32_t prov_pulse_ms = 0;
+
+	for (;;)
+	{
+		const uint64_t now_ms = esp_timer_get_time() / 1000;
+
+		// Provisioning pulsing takes priority over MQTT-driven LED control.
+		const led_prov_state_t prov_state = s_led_prov_state.load();
+		if (prov_state != led_prov_state_t::LED_PROV_STATE_NONE)
+		{
+			const uint32_t period_ms = led_prov_pulse_period_ms(prov_state);
+			if (period_ms > 0)
+			{
+				// Soft breathing pulse peaking in the middle of each interval.
+				prov_pulse_ms = (prov_pulse_ms + 50) % period_ms;
+				const float frac = (float)prov_pulse_ms / (float)period_ms;
+				const float brightness = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac);
+				led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, PROV_PULSE_HUE, 100, (uint32_t)(100.0f * brightness));
+			}
+
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		prov_pulse_ms = 0;
+
+		// Auto-off once the configured duration has elapsed.
+		bool expired = false;
+		{
+			std::lock_guard<std::mutex> lock(led_state.mutex);
+			if (led_state.active && led_state.duration_ms > 0 &&
+				now_ms >= led_state.set_at_ms + led_state.duration_ms)
+			{
+				led_state.active = false;
+				expired = true;
+			}
+		}
+		if (expired)
+		{
+			ESP_LOGI(TAG, "LED auto-off after duration");
+			publish_led_event();
+		}
+
+		bool active;
+		rgb_pattern_t pattern;
+		uint16_t hue;
+		uint8_t saturation, value, brightness;
+		bool has_pixels;
+		std::array<int32_t, LED_COUNT> pixels;
+		uint32_t speed_ms;
+		{
+			std::lock_guard<std::mutex> lock(led_state.mutex);
+			active = led_state.active;
+			pattern = led_state.pattern;
+			hue = led_state.hue;
+			saturation = led_state.saturation;
+			value = led_state.value;
+			brightness = led_state.brightness;
+			has_pixels = led_state.has_pixels;
+			pixels = led_state.pixels;
+			speed_ms = led_state.speed_ms;
+		}
+
+		led_strip.setBrightness(brightness);
+
+		if (!active || pattern == rgb_pattern_t::OFF)
+		{
+			led_strip.clear();
+			phase = 0;
+			last_frame_ms = now_ms;
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		if (has_pixels)
+		{
+			// Per-pixel overrides ignore the pattern generator.
+			led_strip.setAllRgb(0, 0, 0);
+			for (size_t i = 0; i < LED_COUNT; i++)
+			{
+				int32_t px = pixels[i];
+				if (px < 0)
+				{
+					continue;
+				}
+				led_strip.setPixelRgb(i, (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF);
+			}
+			led_strip.flush();
+		}
+		else if (pattern == rgb_pattern_t::SOLID_COLOR)
+		{
+			// Hold the exact requested colour (no animation).
+			led_strip.runPattern(rgb_pattern_t::SOLID_COLOR, hue, saturation, value);
+			last_frame_ms = now_ms;
+		}
+		else
+		{
+			// Animate by advancing the hue/phase offset at the configured speed.
+			if (now_ms - last_frame_ms >= speed_ms)
+			{
+				phase = (phase + 5) % 360;
+				last_frame_ms = now_ms;
+			}
+			led_strip.runPattern(pattern, phase, saturation, value);
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+
+void display_update_task(void *arg)
+{
+	// 1. Allocate a persistent 80,000-byte raw RGB565 canvas in external PSRAM
+	const size_t RGB565_SIZE = 80000;
+	static uint8_t *sd_pixel_buffer = (uint8_t *)heap_caps_malloc(RGB565_SIZE, MALLOC_CAP_SPIRAM);
+	assert(sd_pixel_buffer != NULL);
+	memset(sd_pixel_buffer, 0xFF, RGB565_SIZE); // Default to a pure white canvas
+
+	// 2. Set up our static descriptor wrapper pointing to our unpacked canvas area
+	static lv_image_dsc_t sd_dynamic_bmp;
+	sd_dynamic_bmp.header.magic = LV_IMAGE_HEADER_MAGIC;
+	sd_dynamic_bmp.header.cf = LV_COLOR_FORMAT_RGB565;
+	sd_dynamic_bmp.header.flags = 0;
+	sd_dynamic_bmp.header.w = 200;
+	sd_dynamic_bmp.header.h = 200;
+	sd_dynamic_bmp.header.stride = 400;
+	sd_dynamic_bmp.header.reserved_2 = 0;
+	sd_dynamic_bmp.data_size = RGB565_SIZE;
+	sd_dynamic_bmp.data = sd_pixel_buffer;
+
+	for (;;)
+	{
+		/* Block indefinitely until notified by the download manager task  */
+		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+
+		bool should_update = false;
+		std::string file_path;
+		{
+			std::lock_guard<std::mutex> lock(display_state.mutex);
+			if (display_state.active)
+			{
+				should_update = true;
+				file_path = display_state.data_path;
+				display_state.active = false;
+			}
+		}
+
+		if (should_update)
+		{
+			ESP_LOGI(TAG, "Unpacking 41KB I8 Asset from SD Card: %s", file_path.c_str());
+
+			FILE *f = fopen(file_path.c_str(), "rb");
+			if (f != NULL)
+			{
+				// Step A: Skip the 12-byte LVGL header (we already know it's a 200x200 I8 file)
+				fseek(f, 12, SEEK_SET);
+
+				// Step B: Read the 1,024-byte Color Palette Table (256 colors * 4 bytes/color)
+				uint8_t palette[1024];
+				fread(palette, 1, 1024, f);
+
+				// Step C: Allocate temporary scratchpad memory to read the 40,000 pixel indices
+				uint8_t *indices = (uint8_t *)heap_caps_malloc(40000, MALLOC_CAP_SPIRAM);
+				if (indices != NULL)
+				{
+					fread(indices, 1, 40000, f);
+					fclose(f); // Close file handle immediately 
+					f = NULL;
+
+					// Step D: Translate the 8-bit index values to standard 16-bit RGB565 pixels
+					uint16_t *rgb565_dest = (uint16_t *)sd_pixel_buffer;
+					for (int i = 0; i < 40000; i++)
+					{
+						uint8_t idx = indices[i];
+						
+						// Extract individual Blue, Green, Red bytes from the 32-bit palette entry
+						uint8_t b = palette[idx * 4 + 0];
+						uint8_t g = palette[idx * 4 + 1];
+						uint8_t r = palette[idx * 4 + 2];
+
+						// Pack them into standard 16-bit RGB565 bit arrangements
+						rgb565_dest[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+					}
+					free(indices); // Clean up index scratchpad array
+
+					ESP_LOGI(TAG, "Unpacking complete. Pushing canvas to widget container...");
+
+					// 3. Lock the UI thread before updating live graphics elements 
+					if (example_lvgl_lock(-1))
+					{
+						if (dynamic_epd_image != NULL)
+						{
+							// Force reset and apply our unpacked memory canvas resource 
+							lv_image_set_src(dynamic_epd_image, NULL);
+							lv_image_set_src(dynamic_epd_image, &sd_dynamic_bmp);
+
+							// Unhide and target the layout boundaries for a refresh cycle 
+							lv_obj_clear_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
+							lv_obj_invalidate(dynamic_epd_image);
+						}
+						else
+						{
+							ESP_LOGE(TAG, "Widget Error: global variable 'dynamic_epd_image' is NULL! ");
+						}
+						
+						example_lvgl_unlock(); // Release the thread mutex lock 
+					}
+				}
+				else
+				{
+					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed.");
+				}
+
+				if (f != NULL) fclose(f);
+			}
+			else
+			{
+				ESP_LOGE(TAG, "File System Error: Unable to open file path: %s ", file_path.c_str());
+			}
+
+		}
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+
+extern "C" void app_main(void)
+{
+	// Derive device ID from the factory-programmed base MAC address.
+	// Must run before MQTT or any topic-dependent code.
+	device_id_init();
+	mqtt_dispatch_init();
+
+	// Sensible defaults for the LED subsystem (config.json overrides below).
+	led_state_init_defaults();
+
+	user_app_init();
+	user_app_display_init();
+
+	bool dynamic_factory_reset = check_reset_button_at_boot();
+
+	if (dynamic_factory_reset)
+	{
+		ESP_LOGW(TAG, "=================================================");
+		ESP_LOGW(TAG, "FACTORY RESET TRIGGERED! Wiping system profiles...");
+		ESP_LOGW(TAG, "=================================================");
+		
+		// This completely wipes the default NVS partition where credentials live
+		ESP_ERROR_CHECK(nvs_flash_erase()); 
+
+	}
+
+	/* 	TODO: First thing read the state of a RESET GPIO 
+		If this RESET button is pressed, clear all provisioning info
+		So that the system can be re-provisioned	*/
+
+	SDCardConfig sd_config;
+	sd_config.mountPoint = "/sdcard";
+	sd_config.maxOpenFiles = 5;
+	sd_config.allocationUnitSize = 16 * 1024;
+	sd_config.pinCmd = SDMMC_CMD_PIN;
+	sd_config.pinClk = SDMMC_CLK_PIN;
+	sd_config.pinD0 = SDMMC_D0_PIN;
+
+	sdcard = new SDCardManager(sd_config);
+	std::string fileContent;
+
+	if (sdcard->mount())
+	{
+		ESP_LOGI(TAG, "SD card mounted successfully. You can now perform file operations.");
+		load_settings_from_json();
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to mount SD card. Check the connections and try again.");
+	}
+
+	/* Epaper display initialization */
+	lv_init();
+	lv_display_t *disp = lv_display_create(EPD_WIDTH, EPD_HEIGHT); /* 以水平和垂直分辨率（像素）进行基本初始化 */
+	lv_display_set_flush_cb(disp, example_lvgl_flush_cb);
+	uint8_t *buffer_1 = NULL;
+	buffer_1 = (uint8_t *)heap_caps_malloc(BUFF_SIZE, MALLOC_CAP_SPIRAM);
+	assert(buffer_1);
+	lv_display_set_buffers(disp, buffer_1, NULL, BUFF_SIZE, LV_DISPLAY_RENDER_MODE_FULL);
+
+	ESP_LOGI(TAG, "Install LVGL tick timer");
+	esp_timer_create_args_t lvgl_tick_timer_args = {};
+	lvgl_tick_timer_args.callback = &example_increase_lvgl_tick;
+	lvgl_tick_timer_args.name = "lvgl_tick";
+	esp_timer_handle_t lvgl_tick_timer = NULL;
+	ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
+	ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
+
+	lvgl_mux = xSemaphoreCreateMutex();
+	assert(lvgl_mux);
+
+	/* Initialize NVS partition */
+	esp_err_t ret = nvs_flash_init();
+	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+	{
+		/* NVS partition was truncated
+		 * and needs to be erased */
+		ESP_ERROR_CHECK(nvs_flash_erase());
+
+		/* Retry nvs_flash_init */
+		ESP_ERROR_CHECK(nvs_flash_init());
+	}
+
+	/* Handle OTA cycle results from the factory app (mark VALID, clear stale intents) */
+	ota_handle_boot_state();
+
+	/* Initialize TCP/IP */
+	ESP_ERROR_CHECK(esp_netif_init());
+
+	/* Initialize the event loop */
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	wifi_event_group = xEventGroupCreate();
+
+	/* Register our event handler for Wi-Fi, IP and Provisioning related events */
+	ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+	ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+#endif
+	ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+
+	/* Initialize Wi-Fi including netif with default config */
+	esp_netif_create_default_wifi_sta();
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
+	esp_netif_create_default_wifi_ap();
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	ui_event_queue = xQueueCreate(10, sizeof(ui_event_type_t));
+
+	// 1. Initialize the UI and create widgets FIRST while holding the lock.
+	//    MUST run before the provisioning task spawns: user_ui_init() calls
+	//    lv_obj_clean(lv_screen_active()), which would delete the QR widget
+	//    pushed by wifi_prov_task if the ordering were reversed.
+	if (example_lvgl_lock(-1))
+	{
+		user_ui_init(); // <--- Instantiates 'dynamic_epd_image' safely!
+
+		wifi_status_icon = lv_image_create(lv_screen_active());
+        lv_image_set_src(wifi_status_icon, &wifi_no); // Default to disconnected
+        
+        // Push to the top right corner with a 10px breathing padding
+        lv_obj_align(wifi_status_icon, LV_ALIGN_TOP_RIGHT, -10, 10);
+
+		example_lvgl_unlock();
+	}
+
+	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
+	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
+	// Led Task has low priority so it doesn't interfere with the UI and display tasks
+	xTaskCreate(led_test_task, "led_test", 4096, NULL, 3, &notification_task_handle);
+	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &display_task_handle);
+	xTaskCreate(ui_overlay_update_task, "ui_overlay", 4096, NULL, 4, NULL);
+	xTaskCreate(audio_playback_task, "audio_play", 8192, NULL, 4, &audio_task_handle);
+	// xTaskCreate(audio_boot_task, "audio_boot", 8192, NULL, 5, NULL);
+
+	// =================================================================
+    // 2. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready
+    // =================================================================
+    if (display_state.active && display_task_handle != NULL)
+    {
+        ESP_LOGI(TAG, "Boot configuration detected! Priming display loop...");
+        xTaskNotifyGive(display_task_handle);
+    }
+}
+
+static bool example_lvgl_lock(int timeout_ms)
+{
+	const TickType_t timeout_ticks = (timeout_ms == -1) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+	return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
+}
+
+static void example_lvgl_unlock(void)
+{
+	assert(lvgl_mux && "bsp_display_start must be called first");
+	xSemaphoreGive(lvgl_mux);
+}
+
+static void example_lvgl_port_task(void *arg)
+{
+	uint32_t task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
+	for (;;)
+	{
+		if (example_lvgl_lock(-1))
+		{
+			task_delay_ms = lv_timer_handler();
+			// Release the mutex
+			example_lvgl_unlock();
+		}
+		if (task_delay_ms > EXAMPLE_LVGL_TASK_MAX_DELAY_MS)
+		{
+			task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
+		}
+		else if (task_delay_ms < EXAMPLE_LVGL_TASK_MIN_DELAY_MS)
+		{
+			task_delay_ms = EXAMPLE_LVGL_TASK_MIN_DELAY_MS;
+		}
+		vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+	}
+}
+
+static void wifi_prov_task(void *arg)
+{
+	/* Configuration for the provisioning manager */
+	network_prov_mgr_config_t config = {
+	/* What is the Provisioning Scheme that we want ?
+	 * network_prov_scheme_softap or network_prov_scheme_ble */
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+		.scheme = network_prov_scheme_ble,
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
+		.scheme = network_prov_scheme_softap,
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
+#ifdef CONFIG_EXAMPLE_PROV_ENABLE_APP_CALLBACK
+		.app_event_handler = wifi_prov_event_handler,
+#endif /* EXAMPLE_PROV_ENABLE_APP_CALLBACK */
+
+	/* Any default scheme specific event handler that you would
+	 * like to choose. Since our example application requires
+	 * neither BT nor BLE, we can choose to release the associated
+	 * memory once provisioning is complete, or not needed
+	 * (in case when device is already provisioned). Choosing
+	 * appropriate scheme specific event handler allows the manager
+	 * to take care of this automatically. This can be set to
+	 * NETWORK_PROV_EVENT_HANDLER_NONE when using network_prov_scheme_softap*/
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+		.scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
+		.scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE,
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
+#ifdef CONFIG_EXAMPLE_RESET_PROV_MGR_ON_FAILURE
+		.network_prov_wifi_conn_cfg = {
+			.wifi_conn_attempts = CONFIG_EXAMPLE_PROV_MGR_CONNECTION_CNT}
+#endif
+	};
+
+	/* Initialize provisioning manager with the
+	 * configuration parameters set above */
+	ESP_ERROR_CHECK(network_prov_mgr_init(config));
+
+	bool provisioned = false;
+#ifdef CONFIG_EXAMPLE_RESET_PROVISIONED
+	network_prov_mgr_reset_wifi_provisioning();
+#else
+	/* Let's find out if the device is provisioned */
+	ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
+
+#endif
+	/* If device is not yet provisioned start provisioning service */
+	if (!provisioned)
+	{
+		ESP_LOGI(TAG, "Starting provisioning");
+
+		/* What is the Device Service Name that we want
+		 * This translates to :
+		 *     - Wi-Fi SSID when scheme is network_prov_scheme_softap
+		 *     - device name when scheme is network_prov_scheme_ble
+		 */
+		char service_name[12];
+		get_device_service_name(service_name, sizeof(service_name));
+
+#ifdef CONFIG_EXAMPLE_PROV_SECURITY_VERSION_1
+		/* What is the security level that we want (0, 1, 2):
+		 *      - NETWORK_PROV_SECURITY_0 is simply plain text communication.
+		 *      - NETWORK_PROV_SECURITY_1 is secure communication which consists of secure handshake
+		 *          using X25519 key exchange and proof of possession (pop) and AES-CTR
+		 *          for encryption/decryption of messages.
+		 *      - NETWORK_PROV_SECURITY_2 SRP6a based authentication and key exchange
+		 *        + AES-GCM encryption/decryption of messages
+		 */
+		network_prov_security_t security = NETWORK_PROV_SECURITY_1;
+
+		/* Do we want a proof-of-possession (ignored if Security 0 is selected):
+		 *      - this should be a string with length > 0
+		 *      - NULL if not used
+		 */
+		const char *pop = "abcd1234";
+
+		/* This is the structure for passing security parameters
+		 * for the protocomm security 1.
+		 */
+		network_prov_security1_params_t *sec_params = pop;
+
+		const char *username = NULL;
+
+#elif CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
+		network_prov_security_t security = NETWORK_PROV_SECURITY_2;
+		/* The username must be the same one, which has been used in the generation of salt and verifier */
+
+#if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
+		/* This pop field represents the password that will be used to generate salt and verifier.
+		 * The field is present here in order to generate the QR code containing password.
+		 * In production this password field shall not be stored on the device */
+		const char *username = PROV_SEC2_USERNAME;
+		const char *pop = PROV_SEC2_PWD;
+#elif CONFIG_EXAMPLE_PROV_SEC2_PROD_MODE
+		/* The username and password shall not be embedded in the firmware,
+		 * they should be provided to the user by other means.
+		 * e.g. QR code sticker */
+		const char *username = NULL;
+		const char *pop = NULL;
+#endif
+		/* This is the structure for passing security parameters
+		 * for the protocomm security 2.
+		 * If dynamically allocated, sec2_params pointer and its content
+		 * must be valid till NETWORK_PROV_END event is triggered.
+		 */
+		network_prov_security2_params_t sec2_params = {};
+
+		ESP_ERROR_CHECK(example_get_sec2_salt(&sec2_params.salt, &sec2_params.salt_len));
+		ESP_ERROR_CHECK(example_get_sec2_verifier(&sec2_params.verifier, &sec2_params.verifier_len));
+
+		network_prov_security2_params_t *sec_params = &sec2_params;
+#endif
+		/* What is the service key (could be NULL)
+		 * This translates to :
+		 *     - Wi-Fi password when scheme is network_prov_scheme_softap
+		 *          (Minimum expected length: 8, maximum 64 for WPA2-PSK)
+		 *     - simply ignored when scheme is network_prov_scheme_ble
+		 */
+		const char *service_key = NULL;
+
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+		/* This step is only useful when scheme is network_prov_scheme_ble. This will
+		 * set a custom 128 bit UUID which will be included in the BLE advertisement
+		 * and will correspond to the primary GATT service that provides provisioning
+		 * endpoints as GATT characteristics. Each GATT characteristic will be
+		 * formed using the primary service UUID as base, with different auto assigned
+		 * 12th and 13th bytes (assume counting starts from 0th byte). The client side
+		 * applications must identify the endpoints by reading the User Characteristic
+		 * Description descriptor (0x2901) for each characteristic, which contains the
+		 * endpoint name of the characteristic */
+		uint8_t custom_service_uuid[] = {
+			/* LSB <---------------------------------------
+			 * ---------------------------------------> MSB */
+			0xb4,
+			0xdf,
+			0x5a,
+			0x1c,
+			0x3f,
+			0x6b,
+			0xf4,
+			0xbf,
+			0xea,
+			0x4a,
+			0x82,
+			0x03,
+			0x04,
+			0x90,
+			0x1a,
+			0x02,
+		};
+
+		/* If your build fails with linker errors at this point, then you may have
+		 * forgotten to enable the BT stack or BTDM BLE settings in the SDK (e.g. see
+		 * the sdkconfig.defaults in the example project) */
+		network_prov_scheme_ble_set_service_uuid(custom_service_uuid);
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
+
+		/* An optional endpoint that applications can create if they expect to
+		 * get some additional custom data during provisioning workflow.
+		 * The endpoint name can be anything of your choice.
+		 * This call must be made before starting the provisioning.
+		 */
+		network_prov_mgr_endpoint_create("custom-data");
+
+		/* Do not stop and de-init provisioning even after success,
+		 * so that we can restart it later. */
+#ifdef CONFIG_EXAMPLE_REPROVISIONING
+		network_prov_mgr_disable_auto_stop(1000);
+#endif
+		/* Start provisioning service */
+		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(security, (const void *)sec_params, service_name, service_key));
+
+		/* The handler for the optional endpoint created above.
+		 * This call must be made after starting the provisioning, and only if the endpoint
+		 * has already been created above.
+		 */
+		network_prov_mgr_endpoint_register("custom-data", custom_prov_data_handler, NULL);
+
+		/* Uncomment the following to wait for the provisioning to finish and then release
+		 * the resources of the manager. Since in this case de-initialization is triggered
+		 * by the default event loop handler, we don't need to call the following */
+		// network_prov_mgr_wait();
+		// network_prov_mgr_deinit();
+		/* Print QR code for provisioning */
+#ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
+		wifi_prov_print_qr(service_name, username, pop, PROV_TRANSPORT_BLE);
+#else  /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
+		wifi_prov_print_qr(service_name, username, pop, PROV_TRANSPORT_SOFTAP);
+#endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
+	}
+	else
+	{
+		ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
+
+		/* We don't need the manager as device is already provisioned,
+		 * so let's release it's resources */
+		ESP_ERROR_CHECK(network_prov_mgr_deinit());
+
+		ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+		/* Start Wi-Fi station */
+		wifi_init_sta();
+	}
+
+	/* Wait for Wi-Fi connection */
+	xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+
+	// Clean up binary image representation asset
+	if (example_lvgl_lock(-1))
+	{
+		if (qr_image_obj != NULL)
+		{
+			ESP_LOGI(TAG, "Wi-Fi Up! Cleared binary image QR matrix widget.");
+			lv_obj_delete(qr_image_obj);
+			qr_image_obj = NULL;
+		}
+		if (qr_pixel_buffer != NULL)
+		{
+			heap_caps_free(qr_pixel_buffer);
+			qr_pixel_buffer = NULL;
+		}
+		lv_obj_invalidate(lv_screen_active());
+		example_lvgl_unlock();
+	}
+
+	/* Start main application now */
+#if CONFIG_EXAMPLE_REPROVISIONING
+	while (1)
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			ESP_LOGI(TAG, "Hello World!");
+			vTaskDelay(1000 / portTICK_PERIOD_MS);
+		}
+
+		/* Resetting provisioning state machine to enable re-provisioning */
+		network_prov_mgr_reset_wifi_sm_state_for_reprovision();
+
+		/* Wait for Wi-Fi connection */
+		xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+	}
+#else
+
+	// 1. Create the Queue (holds up to 5 commands)
+	download_cmd_queue = xQueueCreate(5, sizeof(DownloadCommand_t));
+	if (download_cmd_queue == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to create download queue!");
+		abort();
+	}
+
+	// 2. Spawn the Orchestrator Task
+	xTaskCreate(download_orchestrator_task,
+				"DlOrchestrator",
+				4096,
+				NULL,
+				3, // Priority (lower than network, higher than idle)
+				NULL);
+
+	mqtt5_app_start();
+
+	while (1)
+	{
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
+#endif
+}

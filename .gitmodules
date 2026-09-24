@@ -1,3 +1,0 @@
-[submodule "components/epaper"]
-	path = components/epaper
-	url = https://github.com/VedantParanjape/esp-epaper-display.git

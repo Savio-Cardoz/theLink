@@ -1,17 +1,17 @@
 menu "Example Configuration"
 
-    config HTTP_ENDPOINT
-        string "HTTP Endpoint"
-        default "xxx.xxx.xxx.xxx"
+    config BROKER_URL
+        string "Broker URL"
+        default "mqtt://broker.emqx.io"
         help
-            Target endpoint host-name for the example to use.
+            URL of the broker to connect to
     
-    config SHARED_SECRET
-        string "Shared Secret"
-        default "Shared Secret for authentication"
+    config COMMAND_TOPIC
+        string "Command topic"
+        default "company/command"
         help
-            Shared secret for authentication with the server. This should match the pre-shared secret configured on the server side for the device.
-
+            MQTT topic to which the device subscribes to receive commands.
+    
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
         default EXAMPLE_PROV_TRANSPORT_SOFTAP if IDF_TARGET_ESP32S2
