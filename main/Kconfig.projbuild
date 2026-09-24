@@ -2,15 +2,90 @@ menu "Example Configuration"
 
     config BROKER_URL
         string "Broker URL"
-        default "mqtt://broker.emqx.io"
+        default "mqtts://broker.emqx.io:8883"
         help
-            URL of the broker to connect to
-    
+            URL of the broker to connect to. Use the "mqtts://" scheme (TLS on
+            port 8883) whenever possible. When broker certificate verification
+            is required the firmware uses the ESP-IDF certificate bundle.
+
+    config MQTT_USERNAME
+        string "MQTT username"
+        default ""
+        help
+            Optional MQTT username sent to the broker. Leave empty to connect
+            without credentials (e.g. anonymous public brokers).
+
+    config MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            Optional MQTT password sent to the broker (only meaningful when a
+            username is configured).
+
+    choice MQTT_HMAC_MODE
+        bool "MQTT command authenticity mode"
+        default MQTT_HMAC_MODE_DISABLED
+        help
+            Whether incoming MQTT commands must carry an HMAC-SHA256 tag in an
+            MQTT 5 user property ("hmac"). With MQTT 5 enabled the device
+            verifies the tag before dispatching a command to its handler.
+
+            A tag is computed as hex(HMAC-SHA256(key, topic + '\\0' + payload))
+            using CONFIG_MQTT_HMAC_KEY. Tools that cannot compute the tag (e.g.
+            MQTTX with a plain JSON payload) will stop working when this is
+            REQUIRED.
+
+        config MQTT_HMAC_MODE_DISABLED
+            bool "Disabled (no verification)"
+            help
+                Commands are accepted without any authenticity check. Use this
+                for development / tools that cannot compute an HMAC.
+
+        config MQTT_HMAC_MODE_OPTIONAL
+            bool "Optional (accept unsigned, drop invalid tags)"
+            help
+                Commands with a valid tag are trusted; commands without a tag
+                are still accepted (backwards compatible). Commands with an
+                invalid or stale tag are dropped with a warning.
+
+        config MQTT_HMAC_MODE_REQUIRED
+            bool "Required (reject unsigned commands)"
+            help
+                Only commands carrying a valid tag are dispatched. Any command
+                without a tag (or with an invalid/stale tag) is dropped.
+    endchoice
+
+    config MQTT_HMAC_KEY
+        string "MQTT command HMAC secret"
+        default ""
+        help
+            Shared HMAC-SHA256 key used to verify command tags. If left empty
+            while an HMAC mode is enabled, no command can be authenticated
+            (all are dropped). Store a strong random key and keep it secret.
+
+    config MQTT_HMAC_REPLAY_WINDOW_S
+        int "MQTT command replay window (seconds)"
+        default 0
+        help
+            If non-zero, commands must also carry an MQTT 5 user property "ts"
+            set to the publisher's Unix time (decimal seconds). A command whose
+            ts differs from the device time by more than this window is dropped
+            as stale. A value of 0 disables replay protection (ts ignored).
+
     config COMMAND_TOPIC
         string "Command topic"
         default "company/command"
         help
             MQTT topic to which the device subscribes to receive commands.
+
+    config OTA_SIGNATURE_VERIFY
+        bool "Verify signed OTA firmware images"
+        default y
+        help
+            Verify that /sdcard/update.bin is signed (ECDSA P-256 over the
+            SHA-256 digest of the file) before flashing it. The signature in
+            /sdcard/update.bin.sig must match the public key embedded in
+            main/firmware_pubkey.h. Disable to accept unsigned images.
     
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"

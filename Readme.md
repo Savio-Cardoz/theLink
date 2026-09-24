@@ -12,7 +12,7 @@ Everything lives on one small board, and one extra ring of LEDs makes it glow.
 
 - Built right in: 1.54-inch e-paper display, ESP32-S3 (Wi-Fi + Bluetooth), speaker, microphone, microSD card reader
 - You add: a 16-LED NeoPixel ring (the notification LED)
-- Delivers your message over Wi-Fi via MQTT (default broker: `mqtt://broker.emqx.io`)
+- Delivers your message over Wi-Fi via MQTT (default broker: `mqtts://broker.emqx.io:8883`)
 - First-time setup over Bluetooth by scanning a QR code
 
 ---
@@ -531,7 +531,40 @@ Build-time options in `menuconfig` (`Example Configuration`):
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `CONFIG_BROKER_URL` | `mqtt://broker.emqx.io` | MQTT broker address |
+| `CONFIG_BROKER_URL` | `mqtts://broker.emqx.io:8883` | MQTT broker address (`mqtts://` = TLS) |
+| `CONFIG_MQTT_USERNAME` | *(empty)* | Optional MQTT username sent to the broker |
+| `CONFIG_MQTT_PASSWORD` | *(empty)* | Optional MQTT password (use with username) |
+| `CONFIG_MQTT_HMAC_MODE` | `DISABLED` | Command authenticity: `DISABLED` / `OPTIONAL` / `REQUIRED` |
+| `CONFIG_MQTT_HMAC_KEY` | *(empty)* | HMAC-SHA256 secret for command tags |
+| `CONFIG_MQTT_HMAC_REPLAY_WINDOW_S` | `0` | Replay window; `0` disables the `ts` check |
+| `CONFIG_OTA_SIGNATURE_VERIFY` | `y` | Reject unsigned OTA images (ECDSA P-256) |
+
+### MQTT security
+
+- **Transport** — broker certificates are verified against the ESP-IDF
+  certificate bundle (`mqtts://`). A system clock (SNTP) is started on
+  Wi-Fi connect, which TLS validation also depends on.
+- **Command authenticity (optional)** — when `CONFIG_MQTT_HMAC_MODE` is not
+  `DISABLED`, commands must carry an MQTT 5 user property `hmac` equal to
+  `hex(HMAC-SHA256(key, topic + '\0' + payload))`. With MQTTX, publish to the
+  device topic with a **User Property** `hmac`, e.g.:
+
+  ```bash
+  # key = "mysecret", topic + \0 + payload as sent
+  python3 - <<'PY'
+  import hmac, hashlib
+  key = b"mysecret"; topic = b"thelink/<DEVICE_ID>/cmd/rgb"; payload = b'{"action":"on"}'
+  print(hmac.new(key, topic + b"\x00" + payload, hashlib.sha256).hexdigest())
+  PY
+  ```
+
+  `OPTIONAL` accepts unsigned commands but drops invalid tags; `REQUIRED`
+  drops anything unsigned or invalid. `ts` (decimal Unix seconds) is
+  additionally required when `CONFIG_MQTT_HMAC_REPLAY_WINDOW_S > 0`.
+- **OTA integrity** — firmware images are signed (hash-then-sign, ECDSA
+  P-256) and verified on the device before flashing. See
+  [`docs/ota_signing.md`](docs/ota_signing.md) for the full signing process,
+  key management and the optional Secure Boot v2 tier.
 
 ---
 

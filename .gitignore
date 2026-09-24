@@ -88,3 +88,6 @@ Desktop.ini
 client_env/
 private_info/
 *.lock
+
+# Firmware signing keys (private keys must never be committed)
+keys/

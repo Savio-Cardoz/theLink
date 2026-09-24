@@ -29,6 +29,11 @@ CONFIG_CODEC_ES8311_SUPPORT=y
 # MQTT 5.0 (protocol_ver = MQTT_PROTOCOL_V_5) is used by main.cpp mqtt5_app_start.
 CONFIG_MQTT_PROTOCOL_5=y
 
+# MQTT transport security: TLS (mqtts://) + ESP-IDF certificate bundle so the
+# broker's certificate is verified (see main.cpp mqtt5_app_start).
+CONFIG_MQTT_TRANSPORT_SSL=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
 # Memory-corruption diagnostics (remove after root-causing the crash)
 CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 CONFIG_HEAP_POISONING_COMPREHENSIVE=y
