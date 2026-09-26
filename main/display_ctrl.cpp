@@ -32,6 +32,7 @@ struct display_state_t {
 	std::mutex mutex;
 	bool active;
 	std::string data_path;
+	std::string rendered_path; // last image actually pushed to the canvas
 	uint32_t cmd_id;
 };
 
@@ -127,6 +128,14 @@ static void display_update_task(void *arg)
 							// Unhide and target the layout boundaries for a refresh cycle
 							lv_obj_clear_flag(dynamic_epd_image, LV_OBJ_FLAG_HIDDEN);
 							lv_obj_invalidate(dynamic_epd_image);
+
+							// Record the image now on the e-paper. Only set once the
+							// canvas is actually pushed, so a failed unpack never
+							// reports itself as displayed.
+							{
+								std::lock_guard<std::mutex> lock(s_state.mutex);
+								s_state.rendered_path = file_path;
+							}
 						}
 						else
 						{
@@ -224,6 +233,12 @@ void display_ctrl::data_path_set(const std::string &path)
 	std::lock_guard<std::mutex> lock(s_state.mutex);
 	s_state.data_path = path;
 	s_state.active = true;
+}
+
+std::string display_ctrl::rendered_path_get(void)
+{
+	std::lock_guard<std::mutex> lock(s_state.mutex);
+	return s_state.rendered_path;
 }
 
 void display_ctrl::boot_kick_if_active(void)

@@ -143,6 +143,12 @@ void led_ctrl::publish_status(void)
 	cJSON_Delete(root);
 }
 
+const char *led_ctrl::pattern_get(void)
+{
+	std::lock_guard<std::mutex> lock(led_state.mutex);
+	return pattern_to_string(led_state.pattern);
+}
+
 // ── Config.json integration ─────────────────────────────────────────
 
 void led_ctrl::status_serialize(cJSON *led)

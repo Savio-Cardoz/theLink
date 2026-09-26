@@ -24,6 +24,7 @@
 #include "led_ctrl.hpp"
 #include "ota_ctrl.hpp"
 #include "provisioning.hpp"
+#include "status_ctrl.hpp"
 #include "ui_port.hpp"
 
 static const char *TAG = "app";
@@ -72,6 +73,7 @@ extern "C" void app_main(void)
 	display_ctrl::init();
 	audio_ctrl::init();
 	ota_ctrl::init();
+	status_ctrl::init();
 
 	user_app_init();
 	user_app_display_init();

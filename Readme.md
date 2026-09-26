@@ -399,6 +399,27 @@ Changes how loudly the device talks on `evt/log`. Handy when debugging.
 
 ---
 
+### 5.7 Check on the status of theLink — `cmd/status`
+
+Query the device for its status, what is its state.
+
+- **Topic:** `thelink/0A1B2C3D4E5F/cmd/status`
+
+**Ask for the status (any payload works, even an empty one):**
+
+```json
+{}
+```
+
+- **You should see:** a reply on `evt/status` (section 6) with the current
+  firmware version, the LED pattern, the image on the e-paper, and a few
+  supporting details.
+
+The command takes no fields — it is a bare query, so an empty message is fine.
+Nothing is changed by sending it, and the reply is **not** retained.
+
+---
+
 ## 6. What the device sends back (events)
 
 These are mailboxes the device **writes** to. Subscribe to them to watch what
@@ -436,6 +457,41 @@ gets the latest state — no need to wait.
 ```
 
 `status` is one of `started`, `downloaded`, `rebooting`, or `failed`.
+
+### `evt/status` — answer to `cmd/status`
+
+- **Topic:** `thelink/0A1B2C3D4E5F/evt/status`
+
+```json
+{
+  "version": "0.3.0",
+  "rgb_pattern": "rainbow_cycle",
+  "image": "/sdcard/dog.bin",
+  "device_id": "0A1B2C3D4E5F",
+  "partition": "ota_0",
+  "uptime_ms": 128430,
+  "free_heap": 214032,
+  "min_free_heap": 180112,
+  "build": { "date": "Sep 26 2026", "time": "11:42:07", "idf": "v5.4.1" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | Firmware version (matches `version.txt`) |
+| `rgb_pattern` | string | LED pattern currently selected — one of `off`, `solid_color`, `rainbow_cycle`, `theater_chase`, `color_wipe`, `scanner`, `fade` |
+| `image` | string \| null | Full SD path of the image **currently on the e-paper**, or `null` if nothing has been rendered yet |
+| `device_id` | string | Same device ID you used in the topic |
+| `partition` | string \| null | App partition being executed (`ota_0` in a production build) |
+| `uptime_ms` | number | Milliseconds since boot |
+| `free_heap` | number | Free internal heap, in bytes |
+| `min_free_heap` | number | Lowest free heap reached since boot, in bytes |
+| `build` | object | `date`, `time` and IDF `version` of this build. Omitted if the build has no compile timestamp |
+
+`image` only advances once a picture has been unpacked and pushed to the screen,
+so it never claims to be showing an image that failed to download or render.
+It starts out as `null` after a reboot and fills in once the e-paper has been
+drawn.
 
 ### `evt/log` — the device's diary
 
@@ -536,6 +592,10 @@ Build-time options in `menuconfig` (`Example Configuration`):
 ---
 
 ## 9. Version history
+
+### v0.3.1
+- `cmd/status` device-status query: firmware version, current LED pattern and
+  the image on the e-paper, plus partition, uptime, heap and build details
 
 ### v0.3.0
 - Per-subsystem MQTT topics with dedicated handlers
