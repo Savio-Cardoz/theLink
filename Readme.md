@@ -1,23 +1,21 @@
-![theLink](docs/v2.jpg)
+![theLink](docs/v2_build.jpg)
 
 # theLink
 
-theLink is a way to send a surprise to a friend that quietly turns up on their
-desk — no buzzing phone, no notification. Your message arrives as a picture on
-the e-paper screen, a glow from the LED ring, maybe a sound from the speaker. It
-only asks for attention when it has something to show — a mid-day surprise, as
-digitally quiet as possible.
+theLink is a device to send a surprise to a friend that quietly turns up on their
+desk — no buzzing phone, no notification. The message arrives as a picture on
+the e-paper screen, a glow from the LED ring, maybe a sound from the speaker.
 
-Everything lives on one small board, and one extra ring of LEDs makes it glow.
+Everything lives on one small waveshare unit, and one extra ring of LEDs makes it glow.
 
 - Built right in: 1.54-inch e-paper display, ESP32-S3 (Wi-Fi + Bluetooth), speaker, microphone, microSD card reader
-- You add: a 16-LED NeoPixel ring (the notification LED)
-- Delivers your message over Wi-Fi via MQTT (default broker: `mqtt://broker.emqx.io`)
+- I've added a 16-LED NeoPixel ring (the notification LED)
+- Messages arrive over Wi-Fi via MQTT (default broker: `mqtt://broker.emqx.io`)
 - First-time setup over Bluetooth by scanning a QR code
 
 ---
 
-## 1. Your kit
+## 1. What is it
 
 **The unit** — a Waveshare 1.54-inch ESP32-S3 e-paper module. It comes as one
 package and already contains:
@@ -30,20 +28,21 @@ package and already contains:
 | Microphone | (available for future projects) |
 | microSD reader | Stores images and sounds on a card |
 
-**You add** (not included with the board):
+**Additional**
 
 | Piece | Why |
 |-------|-----|
 | 16-LED NeoPixel ring | The glowing "notification LED", data pin wired to GPIO 2 |
 | microSD card (FAT32) | Holds the images and sounds the device downloads |
 | USB-C data cable | For the one-time software flash |
-| Smartphone | For the one-time Wi-Fi setup (Bluetooth) |
+| External Button  | For the one-time Wi-Fi setup (Bluetooth) |
 | Computer | For the one-time software flash |
+| Android phone | For the ESP BLE Provisioning app and IoTHome MQTT dashboard builder app.
 
 **Software you'll use:**
 
-- **MQTTX** — a free app (desktop or phone) for sending and watching messages. This is how your surprise travels to your friend's theLink.
-- **Espressif Provisioning** app (phone) — scans the QR code on the e-paper to give the device your Wi-Fi name and password.
+- **MQTTX** — a free app (desktop or phone) for sending and watching messages. This is how the surprise travels to my friend's via theLink.
+- **Espressif Provisioning** app (phone) — scans the QR code on the e-paper to give the device a Wi-Fi name and password.
 
 ---
 
@@ -63,62 +62,59 @@ package and already contains:
    python3 scripts/build.py flash
    ```
 
-   **Already flashed?** (e.g. you got the device from a friend) — skip this step
-   and go straight to step 2.
-
-2. **Factory reset (only if the device was used before):** hold the reset button
-   (GPIO 3) down while it starts up and keep holding for about 1 second.
+2. **Reset Provisioning:** hold the reset button at the rear
+   (GPIO 3) down while powering it up and keep holding for about 1 second.
 3. **Power on.** After a moment the e-paper shows a QR code and the LED ring starts pulsing.
-4. **Add Wi-Fi:** open the Espressif Provisioning app, scan the QR code, and enter your Wi-Fi network name and password.
+4. **Add Wi-Fi:** open the Espressif Provisioning app, scan the QR code, and enter the Wi-Fi network name and password.
 5. **Done.** The LED ring stops pulsing once it connects — the device is ready.
 
-### What the LED ring is telling you
+### LED ring indicators during provisioning
 
-The ring tells you which stage of setup it is in:
+The ring shows which stage of setup it is in:
 
-| You see | What it means |
+| Effect | What it means |
 |---------|---------------|
 | Fast blue pulse (every 0.5 s) | Provisioning is active — it's waiting for a phone |
 | Medium blue pulse (every 1.5 s) | A phone is connected over Bluetooth |
-| Slow blue pulse (every 3 s) | It connected to your Wi-Fi |
-| Ring does what your MQTT messages say | Setup is complete — it's all yours |
+| Slow blue pulse (every 3 s) | It connected to the Wi-Fi |
+| Ring does behaves as MQTT messages say | Setup is complete |
 
 ---
 
-## 3. Meet MQTT (the 2-minute version)
+## 3. MQTT Communication
 
-MQTT is how a message travels from you to your friend's theLink over Wi-Fi. It works like a post office:
+MQTT is how a message travels from me to my friend's theLink over Wi-Fi. It works like a post office:
 
 - **Broker** = the post office in the middle (there's a free public one at `broker.emqx.io`).
 - **Topic** = a mailbox name. The device checks certain mailboxes and ignores the rest.
-- **Message** = the letter inside the mailbox. We write these as JSON.
+- **Message** = the letter inside the mailbox. JSON text
 
 **Heads-up:** `0A1B2C3D4E5F` in the topics below is a placeholder — it stands for
-the 6-byte MAC address of *your* ESP32 chip, not the real ID. Section 4 shows you
-how to find yours and swap it in.
+the 6-byte MAC address of the ESP32 chip in use. Section 4 shows 
+how to find the MAC and swap it in.
 
 Topics come in two flavours:
 
 | Kind | Looks like | Meaning |
 |------|-----------|---------|
-| `cmd/` (commands) | `thelink/0A1B2C3D4E5F/cmd/rgb` | Mailboxes the device **reads** — where you post your messages |
+| `cmd/` (commands) | `thelink/0A1B2C3D4E5F/cmd/rgb` | Mailboxes the device **reads** — where to post messages |
 | `evt/` (events) | `thelink/0A1B2C3D4E5F/evt/led` | Mailboxes the device **writes** — its replies |
 
-**Your first 60 seconds with MQTTX:**
+**First 60 seconds with MQTTX:**
 
 1. Open MQTTX and add a connection to `broker.emqx.io` (port `1883`).
-2. Subscribe (listen) to topic `thelink/0A1B2C3D4E5F/evt/#` (remember: replace `0A1B2C3D4E5F` with your device's ID).
+2. Subscribe (listen) to topic `thelink/0A1B2C3D4E5F/evt/#` (remember: replace `0A1B2C3D4E5F` with device's ID).
 3. Publish (send) to topic `thelink/0A1B2C3D4E5F/cmd/rgb` this message:
 
    ```json
    { "pattern": "rainbow_cycle" }
    ```
 
-4. Watch the ring go rainbow. You just hand-delivered your first message.
+4. The ring goes rainbow. First message delivered
 
 ---
 
-## 4. Find your device ID
+## 4. Find the device ID
 
 Every example in this guide uses the placeholder device ID `0A1B2C3D4E5F`.
 **Your device has its own.** It is the 6-byte factory MAC address of your board,
@@ -138,7 +134,7 @@ Pick a section, copy the topic, copy the message, and paste them into MQTTX.
 
 ### 5.1 Show an image — `cmd/display`
 
-Downloads a picture from the internet, saves it on the SD card, and shows it on the e-paper.
+Downloads a picture from the server, saves it on the SD card, and shows it on the e-paper.
 
 - **Topic:** `thelink/0A1B2C3D4E5F/cmd/display`
 - **Publish this:**
@@ -180,9 +176,7 @@ own HTTP server, then point the message at it.
    python3 -m http.server
    ```
 
-   Now your file is available at `http://<your-computer-ip>:8000/myphoto.bin`.
-   (Find your IP with `ipconfig` on Windows. To reach the device from the internet,
-   use a server that is already online.)
+   Now your file is available at `http://<your-server-ip>:8000/myphoto.bin`.
 
 3. **Use that link as `download`** — the URL of the `.bin` on your server goes into
    the message:
@@ -512,7 +506,7 @@ drawn.
 
 | Problem | Try this |
 |---------|----------|
-| LED ring does nothing | Check power; make sure you flashed the firmware (section 2) |
+| LED ring does nothing | Check power; make sure you flashed the firmware (section 2); check Data line connection |
 | Ring pulses forever after setup | Wi-Fi credentials didn't save — factory reset (hold reset ~1 s at boot) and re-provision |
 | Screen stays blank | Check the SD card is inserted, formatted FAT32, and your file was downloaded (watch `evt/led` isn't enough — check `evt` and the serial log) |
 | Nothing happens / no `evt/led` reply | Wrong device ID in the topic, or the broker address doesn't match. Verify the device ID in the boot log |
@@ -546,6 +540,7 @@ Notes:
 - Export must be repeated in every new terminal (environment variables are per-session).
 - A stale `IDF_PATH` overrides the new value inside already-open terminals — restart after changing it.
 - `scripts/build.py` and `scripts/flash_all.py` auto-locate the ESP-IDF Python environment, so they work without the export (the export is still needed to call `idf.py`, `esptool.py`, or `menuconfig` directly).
+The project uses my [esp32_factory_app](https://github.com/Savio-Cardoz/esp32_factory_app.git) repo as the update flashing app. This app resides in the factory parition.
 
 ### Build profiles
 
