@@ -19,7 +19,7 @@ flowchart LR
     REG --> LOOKUP
     LOOKUP -->|"No"| WARN["Log warning"]
     LOOKUP -->|"Yes"| ROUTE["Invoke registered handler"]
-    ROUTE --> ACTION["LED, display, audio,<br/>OTA, or logger action"]
+    ROUTE --> ACTION["LED, display, audio,<br/>OTA, status, or logger action"]
 ```
 
 ## Detailed architecture
@@ -29,15 +29,17 @@ flowchart TB
     subgraph BOOT["1. Boot-time registration"]
         direction LR
         APP["app_main()"] --> ID["identity_init()<br/>MAC address to device ID"]
-        ID --> CTRL["led, display, audio,<br/>and OTA init"]
+        ID --> CTRL["led, display, audio,<br/>OTA, and status init"]
         CTRL --> LEDREG["Register cmd/rgb and<br/>cmd/notification"]
         CTRL --> DISPLAYREG["Register cmd/display"]
         CTRL --> AUDIOREG["Register cmd/audio"]
         CTRL --> OTAREG["Register cmd/ota"]
+        CTRL --> STATUSREG["Register cmd/status"]
         LEDREG --> REGISTRY["s_cmd_dispatch<br/>exact topic to MqttCmdHandler"]
         DISPLAYREG --> REGISTRY
         AUDIOREG --> REGISTRY
         OTAREG --> REGISTRY
+        STATUSREG --> REGISTRY
 
         APP --> WIFI["provisioning_start()<br/>wait for Wi-Fi IP"]
         WIFI --> DOWNLOADSTART["download::start()"]
@@ -66,6 +68,7 @@ flowchart TB
         INVOKE --> DISPLAYH["Display handler<br/>cJSON validation<br/>enqueue download or set image"]
         INVOKE --> AUDIOH["Audio handler<br/>cJSON validation<br/>enqueue download or play file"]
         INVOKE --> OTAH["OTA handler<br/>cJSON validation<br/>publish started; enqueue firmware"]
+        INVOKE --> STATUSH["Status handler<br/>bare query<br/>publish evt/status snapshot"]
         INVOKE --> LOGH["Logger handler<br/>cJSON validation<br/>get or set log level"]
     end
 
@@ -89,11 +92,13 @@ flowchart TB
         LOGH --> LOGGER["MQTT logger"]
         LOGGER --> EVTLOG["Publish evt/log"]
         OTAH --> EVTOTA["Publish evt/ota"]
+        STATUSH --> EVTSTAT["Publish evt/status"]
     end
 
     EVTLED --> BROKER
     EVTLOG --> BROKER
     EVTOTA --> BROKER
+    EVTSTAT --> BROKER
 ```
 
 ## Registered routes
@@ -105,18 +110,21 @@ flowchart TB
 | `thelink/{ID}/cmd/display` | `display_ctrl::handle_command` | Validates `download` and `filename`, optionally queues a download, and updates display state. |
 | `thelink/{ID}/cmd/audio` | `audio_ctrl::handle_command` | Validates `download`, `filename`, and optional `volume`, then queues or plays audio. |
 | `thelink/{ID}/cmd/ota` | `ota_ctrl::handle_command` | Validates the firmware URL, publishes `evt/ota: started`, and queues `update.bin`. |
+| `thelink/{ID}/cmd/status` | `status_ctrl::handle_status_command` | Bare query (payload ignored); publishes `evt/status` snapshot: firmware `version`, `rgb_pattern`, rendered `image`, `device_id`, running `partition`, `uptime_ms`, free/min-free heap, and optional `build` info. QoS 1, not retained. |
 | `thelink/{ID}/cmd/log` | `mqtt_logger_handle_command` | Handles `get_level` and `set_level`; responses use `evt/log`. |
 
 ## Source map
 
-- Device-specific topic construction: `main/identity.cpp:21-42`
-- Controller registration before networking: `main/app_main.cpp:63-74`
+- Device-specific topic construction: `main/identity.cpp:23-52`
+- Controller registration before networking: `main/app_main.cpp:64-76`
 - Command registry and registration API: `main/mqtt_io.cpp:18-23`, `main/mqtt_io.hpp:8-13`
 - Broker-dependent startup: `main/provisioning.cpp:678-701`
-- MQTT v5 client creation: `main/mqtt_io.cpp:116-128`
+- MQTT v5 client creation: `main/mqtt_io.cpp:116-129`
 - Subscription creation from registry keys: `main/mqtt_io.cpp:40-49`
 - Payload copy, exact lookup, and direct invocation: `main/mqtt_io.cpp:71-100`
 - Display, audio, and firmware routing through the download queue: `main/download_mgr.cpp:45-58`, `main/download_mgr.cpp:128-150`
+- Status handler registration: `main/status_ctrl.cpp:95-98`
+- Status snapshot composition: `main/status_ctrl.cpp:23-84`
 
 ## Routing characteristics
 

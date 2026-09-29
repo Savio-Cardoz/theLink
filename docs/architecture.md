@@ -236,7 +236,7 @@ The contract in practice:
 | Aspect | Behaviour |
 |--------|-----------|
 | Lookup | `std::map::find` on the full topic string. **Exact match** — no wildcards, no prefix matching. |
-| Ordering | The table is populated entirely during `app_main`, before `mqtt_io_start()` runs, and is only read afterwards. That is why it needs no mutex. |
+| Ordering | Registration happens before the client starts: controllers self-register in `app_main` via their `init()` calls, and `cmd/log` is added at the top of `mqtt_io_start()` itself (`mqtt_io.cpp:116-118`). After that the table is only read — that is why it needs no mutex. |
 | Re-registration | `operator[]` silently replaces the handler. There is no duplicate detection. |
 | Payload | Always a NUL-terminated copy, valid only for the duration of the call. Handlers must not store the pointer. |
 | Subscription | Derived: `MQTT_EVENT_CONNECTED` subscribes to every key at QoS 1, and re-runs on each reconnect. |
