@@ -18,6 +18,7 @@ static char s_mqtt_cmd_ota_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_status_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_led_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_ota_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_evt_sensor_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_status_topic[MQTT_TOPIC_MAX_LEN];
 
 void identity_init(void)
@@ -48,6 +49,8 @@ void identity_init(void)
 			 "thelink/%s/evt/led", s_device_id);
 	snprintf(s_mqtt_evt_ota_topic, sizeof(s_mqtt_evt_ota_topic),
 			 "thelink/%s/evt/ota", s_device_id);
+	snprintf(s_mqtt_evt_sensor_topic, sizeof(s_mqtt_evt_sensor_topic),
+			 "thelink/%s/evt/sensor", s_device_id);
 	snprintf(s_mqtt_evt_status_topic, sizeof(s_mqtt_evt_status_topic),
 			 "thelink/%s/evt/status", s_device_id);
 
@@ -61,6 +64,7 @@ void identity_init(void)
 	ESP_LOGI("DEVICE", "Status cmd topic: %s", s_mqtt_cmd_status_topic);
 	ESP_LOGI("DEVICE", "LED evt topic: %s", s_mqtt_evt_led_topic);
 	ESP_LOGI("DEVICE", "OTA evt topic: %s", s_mqtt_evt_ota_topic);
+	ESP_LOGI("DEVICE", "Sensor evt topic: %s", s_mqtt_evt_sensor_topic);
 	ESP_LOGI("DEVICE", "Status evt topic: %s", s_mqtt_evt_status_topic);
 }
 
@@ -112,6 +116,11 @@ const char *identity_topic_evt_led(void)
 const char *identity_topic_evt_ota(void)
 {
 	return s_mqtt_evt_ota_topic;
+}
+
+const char *identity_topic_evt_sensor(void)
+{
+	return s_mqtt_evt_sensor_topic;
 }
 
 const char *identity_topic_evt_status(void)
