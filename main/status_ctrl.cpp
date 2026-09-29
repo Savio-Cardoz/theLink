@@ -15,6 +15,7 @@
 #include "identity.hpp"
 #include "led_ctrl.hpp"
 #include "mqtt_io.hpp"
+#include "sensor_ctrl.hpp"
 
 #include "status_ctrl.hpp"
 
@@ -47,6 +48,10 @@ static void publish_status(void)
 
 	// ── Supporting device information ─────────────────────────────────
 	cJSON_AddStringToObject(root, "device_id", identity_device_id());
+
+	// Cached last-good reading, or nulls when the sensor has not produced a
+	// valid sample yet.
+	sensor_ctrl::status_serialize(root);
 
 	const esp_partition_t *running = esp_ota_get_running_partition();
 	if (running != nullptr)

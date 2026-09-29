@@ -16,4 +16,5 @@ const char *identity_topic_cmd_ota(void);
 const char *identity_topic_cmd_status(void);
 const char *identity_topic_evt_led(void);
 const char *identity_topic_evt_ota(void);
+const char *identity_topic_evt_sensor(void);
 const char *identity_topic_evt_status(void);
