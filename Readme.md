@@ -406,8 +406,8 @@ Query the device for its status, what is its state.
 ```
 
 - **You should see:** a reply on `evt/status` (section 6) with the current
-  firmware version, the LED pattern, the image on the e-paper, and a few
-  supporting details.
+  firmware version, the LED pattern, the image on the e-paper, how much room is
+  left on the SD card, and a few supporting details.
 
 The command takes no fields — it is a bare query, so an empty message is fine.
 Nothing is changed by sending it, and the reply is **not** retained.
@@ -466,6 +466,7 @@ gets the latest state — no need to wait.
   "uptime_ms": 128430,
   "free_heap": 214032,
   "min_free_heap": 180112,
+  "sdcard": { "mounted": true, "total_bytes": 31914983424, "free_bytes": 30012345678 },
   "build": { "date": "Sep 26 2026", "time": "11:42:07", "idf": "v5.4.1" }
 }
 ```
@@ -480,12 +481,18 @@ gets the latest state — no need to wait.
 | `uptime_ms` | number | Milliseconds since boot |
 | `free_heap` | number | Free internal heap, in bytes |
 | `min_free_heap` | number | Lowest free heap reached since boot, in bytes |
+| `sdcard` | object \| null | `mounted`, `total_bytes` and `free_bytes` of the SD card, or `null` if no card is present |
 | `build` | object | `date`, `time` and IDF `version` of this build. Omitted if the build has no compile timestamp |
 
 `image` only advances once a picture has been unpacked and pushed to the screen,
 so it never claims to be showing an image that failed to download or render.
 It starts out as `null` after a reboot and fills in once the e-paper has been
 drawn.
+
+`sdcard` is `null` rather than zeroed when the card is absent, so a missing card
+is never mistaken for a full one. Its sizes describe the FAT volume, meaning
+filesystem overhead is already excluded — the numbers are what you can actually
+store, not the card's advertised capacity.
 
 ### `evt/log` — the device's diary
 
@@ -591,6 +598,8 @@ Build-time options in `menuconfig` (`Example Configuration`):
 ### v0.3.1
 - `cmd/status` device-status query: firmware version, current LED pattern and
   the image on the e-paper, plus partition, uptime, heap and build details
+- SD card size and free space added to the `evt/status` reply as a `sdcard`
+  object, `null` when no card is present
 
 ### v0.3.0
 - Per-subsystem MQTT topics with dedicated handlers

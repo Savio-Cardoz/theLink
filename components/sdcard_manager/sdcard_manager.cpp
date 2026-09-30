@@ -4,11 +4,15 @@
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
 
-#define SD_MOUNT_POINT "/sdcard" // Default mount point for the SD card
 #define SD_MAX_OPEN_FILES 5
 #define SD_ALLOCATION_UNIT_SIZE (16 * 1024 * 3) // 48 KB, similar to a sector size
 
 static const char *TAG = "SD_MANAGER";
+
+namespace {
+// Backs SDCardManager::mountPath() when the config leaves the path unset.
+const std::string kDefaultMountPoint = SD_MOUNT_POINT;
+} // namespace
 
 SDCardManager::SDCardManager(const SDCardConfig &config)
     : m_config(config), m_mounted(false), m_card(nullptr) {}
@@ -56,7 +60,7 @@ bool SDCardManager::mount()
     mount_config.allocation_unit_size = m_config.allocationUnitSize; // Use larger allocation unit for better performance
 
     // 4. Mount the filesystem
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &m_card);
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(mountPath().c_str(), &host, &slot_config, &mount_config, &m_card);
 
     if (ret != ESP_OK)
     {
@@ -73,7 +77,7 @@ bool SDCardManager::mount()
         return false;
     }
 
-    ESP_LOGI(TAG, "SD card mounted successfully at %s", SD_MOUNT_POINT);
+    ESP_LOGI(TAG, "SD card mounted successfully at %s", mountPath().c_str());
     sdmmc_card_print_info(stdout, m_card);
 
     m_mounted = true;
@@ -90,7 +94,7 @@ void SDCardManager::unmount()
     ESP_LOGI(TAG, "Unmounting SD card...");
 
     // Unmount the partition and tear down the SDMMC host
-    esp_err_t ret = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, m_card);
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(mountPath().c_str(), m_card);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to unmount SD card. Error: %s", esp_err_to_name(ret));
@@ -106,15 +110,50 @@ bool SDCardManager::isMounted() const
     return m_mounted;
 }
 
+bool SDCardManager::getSpaceInfo(uint64_t &totalBytes, uint64_t &freeBytes) const
+{
+    totalBytes = 0;
+    freeBytes = 0;
+
+    if (!m_mounted)
+    {
+        return false;
+    }
+
+    // Reports the FAT volume's real capacity and headroom, so both numbers
+    // already have filesystem overhead removed — unlike the raw card capacity
+    // in sdmmc_card_t, which is not available to the user.
+    uint64_t total = 0;
+    uint64_t free = 0;
+    esp_err_t err = esp_vfs_fat_info(mountPath().c_str(), &total, &free);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to query space on %s: %s",
+                 mountPath().c_str(), esp_err_to_name(err));
+        return false;
+    }
+
+    totalBytes = total;
+    freeBytes = free;
+    return true;
+}
+
+const std::string &SDCardManager::mountPath() const
+{
+    return m_config.mountPoint.empty() ? kDefaultMountPoint : m_config.mountPoint;
+}
+
 std::string SDCardManager::resolvePath(const std::string &filename) const
 {
+    const std::string &base = mountPath();
+
     // Combine the VFS mount point (e.g., "/sdcard") with the filename
     // Ensure we don't double up on slashes if filename already has one
     if (!filename.empty() && filename[0] == '/')
     {
-        return std::string(SD_MOUNT_POINT) + filename;
+        return base + filename;
     }
-    return std::string(SD_MOUNT_POINT) + "/" + filename;
+    return base + "/" + filename;
 }
 
 bool SDCardManager::readTextFile(const std::string &path, std::string &outContent)

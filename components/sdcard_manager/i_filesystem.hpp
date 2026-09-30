@@ -1,6 +1,5 @@
 #pragma once
-// #include <cstdint>
-// #include <cstddef>
+#include <cstdint>
 #include <string>
 
 /** 
@@ -14,6 +13,11 @@ public:
     virtual bool mount() = 0;
     virtual void unmount() = 0;
     virtual bool isMounted() const = 0;
+
+    // Capacity of the mounted volume, for diagnostics. Both outputs are zeroed
+    // and false is returned when there is no volume or it cannot be queried, so
+    // callers never have to guess whether the numbers are meaningful.
+    virtual bool getSpaceInfo(uint64_t &totalBytes, uint64_t &freeBytes) const = 0;
 
     // Core File Operations
     virtual bool fileExists(const std::string& path) const = 0;

@@ -91,7 +91,7 @@ extern "C" void app_main(void)
 	}
 
 	SDCardConfig sd_config;
-	sd_config.mountPoint = "/sdcard";
+	sd_config.mountPoint = SD_MOUNT_POINT;
 	sd_config.maxOpenFiles = 5;
 	sd_config.allocationUnitSize = 16 * 1024;
 	sd_config.pinCmd = SDMMC_CMD_PIN;
