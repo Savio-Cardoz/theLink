@@ -8,7 +8,8 @@
 #include "esp_err.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 // Sensirion SHTC3: temperature + relative-humidity sensor. I2C address 0x70
@@ -50,23 +51,23 @@ extern "C" {
 // reference implementation uses and is far more than the sensor ever needs.
 #define SHTC3_WAKEUP_WAIT_MS 50
 
-// Attach to an already-installed I2C master bus. The caller owns the bus and
-// must keep it alive for as long as this device handle is used.
-esp_err_t shtc3_init(i2c_master_bus_handle_t bus, uint8_t dev_addr);
+    // Attach to an already-installed I2C master bus. The caller owns the bus and
+    // must keep it alive for as long as this device handle is used.
+    esp_err_t shtc3_init(i2c_master_bus_handle_t bus, uint8_t dev_addr);
 
-// Whether the sensor acknowledges at the address shtc3_init() attached it to.
-// Cheap presence check for logs and for deciding whether the module is worth
-// enabling. Logs the outcome either way: a silent false is what makes a broken
-// sensor look like a broken bus.
-bool shtc3_present(void);
+    // Whether the sensor acknowledges at the address shtc3_init() attached it to.
+    // Cheap presence check for logs and for deciding whether the module is worth
+    // enabling. Logs the outcome either way: a silent false is what makes a broken
+    // sensor look like a broken bus.
+    bool shtc3_present(void);
 
-// One blocking measurement. Returns ESP_OK only when both CRC bytes verify and
-// the decoded values fall inside the sensor's specified range, so a caller can
-// never publish a reading that is really bus noise. Every failure is logged with
-// its stage, since the driver reports a NACK as ESP_ERR_INVALID_STATE.
-esp_err_t shtc3_read(float *temperature_c, float *humidity_pct);
+    // One blocking measurement. Returns ESP_OK only when both CRC bytes verify and
+    // the decoded values fall inside the sensor's specified range, so a caller can
+    // never publish a reading that is really bus noise. Every failure is logged with
+    // its stage, since the driver reports a NACK as ESP_ERR_INVALID_STATE.
+    esp_err_t shtc3_read(float *temperature_c, float *humidity_pct);
 
-void shtc3_deinit(void);
+    void shtc3_deinit(void);
 
 #ifdef __cplusplus
 }

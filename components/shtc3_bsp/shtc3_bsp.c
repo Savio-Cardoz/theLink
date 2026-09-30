@@ -84,7 +84,7 @@ static esp_err_t shtc3_read_id(void)
     uint8_t id[3] = {0};
 
     const esp_err_t err = i2c_master_transmit_receive(s_dev, cmd, sizeof(cmd), id, sizeof(id),
-                                                     SHTC3_XFER_TIMEOUT_MS);
+                                                      SHTC3_XFER_TIMEOUT_MS);
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "ID read 0x%04X NACKed at 0x%02X (%s)", SHTC3_CMD_READ_ID, s_addr,

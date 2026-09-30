@@ -717,13 +717,6 @@ format.
 - New shared `i2c_bsp` component owning the board I2C bus, so the codec and the
   sensor share one bus instead of each creating their own
 - Failed sensor reads keep the last good reading rather than publishing `null`
-- On-board SHTC3 temperature and humidity sensor
-- New retained `evt/sensor` event, published at boot and then every 5 minutes,
-  and re-published on every MQTT reconnect
-- `cmd/status` now includes the cached reading in a `sensor` object
-- New shared `i2c_bsp` component owning the board I2C bus, so the codec and the
-  sensor share one bus instead of each creating their own
-- Failed sensor reads keep the last good reading rather than publishing `null`
 - MQTT broker settings asked for at build time: the broker URL
   (`CONFIG_BROKER_URL`) and its credentials (`CONFIG_MQTT_USERNAME` /
   `CONFIG_MQTT_PASSWORD`), sent to the broker on connect
