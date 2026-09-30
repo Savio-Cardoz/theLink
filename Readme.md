@@ -489,7 +489,14 @@ If a read fails (sensor not yet powered, bus error, or a bad checksum) the
 device logs a warning and keeps the previous reading rather than publishing a
 blank one, so a stale number is never silently replaced by `null`. The
 temperature and humidity fields are `null` only until the very first successful
-sample.
+sample. Each read is attempted three times before the cycle gives up, and the
+first attempt is held back until about two seconds after boot so it does not
+race the audio codec coming up on the same I2C bus.
+
+At boot the driver also reads the sensor's ID register and logs it, e.g.
+`SHTC3: ID 0x0910 (CRC ok)`. That is the quickest way to tell a working sensor
+from a dead one: no ID line, or a CRC failure, means the part never identified
+itself. See the troubleshooting table (section 7).
 
 ### `evt/status` — answer to `cmd/status`
 
@@ -560,7 +567,7 @@ so it stays fast. Use `age_ms` to tell a fresh reading from one taken at boot.
 | Nothing happens / no `evt/led` reply | Wrong device ID in the topic, or the broker address doesn't match. Verify the device ID in the boot log |
 | Image doesn't show | Convert it first with `python3 scripts/png_to_epaper.py` — it must be LVGL I8, 200x200, with a 256-colour palette, and hosted on your own HTTP server |
 | Sound doesn't play | File must exist on the SD card (use `"download": ""` for a file already there) |
-| `evt/sensor` never arrives | The SHTC3 shares the I2C segment powered by the audio rail. Check the serial log for `SHTC3` — `nothing at 0x70` means the sensor did not acknowledge, and `CRC mismatch` means the bus is noisy. Both retry automatically on the next 5-minute tick |
+| `evt/sensor` never arrives | Start with `ID 0x….  (CRC ok)` and `SHTC3 attached at 0x70`, then the `I2C scan on SDA 47 / SCL 48:` line printed about two seconds after boot. The scan names every device that answered: `0x18` ES8311, `0x51` PCF85063 RTC, `0x70` SHTC3. A missing `0x70`, or an `ID read 0xEFC8 NACKed at 0x70` at attach, is hardware — the sensor never identified itself. If the ID verifies but a read still fails, `measurement command 0x7866 NACKed at 0x70` means it answered the probe and the identity read but not the measurement, and `CRC mismatch` means the bus is noisy. A read is retried three times per cycle, then left to the next 5-minute tick |
 
 ---
 

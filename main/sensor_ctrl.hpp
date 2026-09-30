@@ -5,11 +5,12 @@
 
 // On-board SHTC3 temperature and humidity sensor.
 //
-// The sensor lives on the same I2C segment as the audio codec and is powered
-// by the same audio rail, so sampling has to happen after the audio board is
-// powered up. A dedicated task takes periodic readings, keeps the latest valid
-// one, publishes it to evt/sensor, and lets status_ctrl fold it into evt/status
-// without anyone having to ask for a synchronous reading.
+// The sensor lives on the same I2C segment as the audio codec and its rail comes
+// up with the audio subsystem, so a dedicated task waits for the bus to settle,
+// sweeps it once for the boot log, and only then starts sampling periodically.
+// It keeps the latest valid reading, publishes it to evt/sensor, and lets
+// status_ctrl fold it into evt/status without anyone having to ask for a
+// synchronous reading.
 namespace sensor_ctrl
 {
 

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 
@@ -25,6 +26,22 @@ static const char *TAG = "app";
 // value to report right away, then slowly from there.
 #define SENSOR_SAMPLE_INTERVAL_MS 300000
 
+// The SHTC3 shares the bus with the audio codec, which is still registering the
+// ES8311 at this point in boot. Sweeping and sampling before that finishes
+// measures a bus that is still coming up, so both wait it out first.
+#define SENSOR_BUS_SETTLE_MS 2000
+
+// A read can lose a single race with the codec's own register writes, so retry
+// inside one cycle before giving up on it for the next five minutes.
+#define SENSOR_READ_ATTEMPTS 3
+#define SENSOR_READ_RETRY_MS 200
+
+// 0x00-0x07 and 0x78-0x7F are reserved blocks: a device answering there is a
+// wiring fault, not a device worth reporting.
+#define SENSOR_SCAN_FIRST_ADDR 0x08
+#define SENSOR_SCAN_LAST_ADDR 0x77
+#define SENSOR_SCAN_MAX_FOUND 16
+
 namespace
 {
 
@@ -41,18 +58,82 @@ struct sensor_state_t
 
 sensor_state_t g_state;
 
-// Reads the sensor and, on success, refreshes the cache. A failed read is
-// logged and otherwise ignored: the retained evt/sensor message is more useful
-// stale than overwritten with nulls, and the next tick tries again.
+// One line naming every device that answered on the shared bus. This is the
+// first thing to read when a unit does not report a temperature: an address
+// missing from the list is a hardware problem, an address present but a read
+// that still fails is one of ours.
+void sensor_scan_bus()
+{
+    uint8_t found[SENSOR_SCAN_MAX_FOUND] = {0};
+    size_t found_count = 0;
+
+    const esp_err_t err = i2c_bsp_scan(ESP32_I2C_DEV_NUM, SENSOR_SCAN_FIRST_ADDR, SENSOR_SCAN_LAST_ADDR,
+                                       found, sizeof(found), &found_count);
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "I2C scan skipped, no master bus on port %d", ESP32_I2C_DEV_NUM);
+        return;
+    }
+
+    char list[sizeof(found) * 5] = {0};
+    size_t used = 0;
+    for (size_t i = 0; i < found_count; i++)
+    {
+        used += snprintf(list + used, sizeof(list) - used, "%s0x%02X", (i == 0) ? "" : " ", found[i]);
+    }
+
+    if (err == ESP_ERR_TIMEOUT)
+    {
+        ESP_LOGW(TAG, "I2C scan on SDA %d / SCL %d: bus timed out, SDA held low or pull-ups missing (so far: %s)",
+                 ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN, list);
+        return;
+    }
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "I2C scan on SDA %d / SCL %d failed: %s", ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN,
+                 esp_err_to_name(err));
+        return;
+    }
+    if (found_count == 0)
+    {
+        ESP_LOGW(TAG, "I2C scan on SDA %d / SCL %d: no device answered, check pull-ups and wiring",
+                 ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN);
+        return;
+    }
+
+    ESP_LOGI(TAG, "I2C scan on SDA %d / SCL %d: %s", ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN, list);
+}
+
+// Reads the sensor and, on success, refreshes the cache. A read that keeps
+// failing is logged and otherwise ignored: the retained evt/sensor message is
+// more useful stale than overwritten with nulls, and the next tick tries again.
 void sensor_sample()
 {
     float temperature_c = 0.0f;
     float humidity_pct = 0.0f;
-    const esp_err_t err = shtc3_read(&temperature_c, &humidity_pct);
+    esp_err_t err = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= SENSOR_READ_ATTEMPTS; attempt++)
+    {
+        err = shtc3_read(&temperature_c, &humidity_pct);
+        if (err == ESP_OK)
+        {
+            break;
+        }
+        if (attempt < SENSOR_READ_ATTEMPTS)
+        {
+            ESP_LOGW(TAG, "SHTC3 read failed (%s), retrying in %d ms", esp_err_to_name(err), SENSOR_READ_RETRY_MS);
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_MS));
+        }
+    }
 
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "SHTC3 read failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "SHTC3 read failed after %d attempts: %s", SENSOR_READ_ATTEMPTS, esp_err_to_name(err));
+        // shtc3_present() logs whether the sensor is still on the bus, which is
+        // what separates a dead sensor from a measurement this module could not
+        // complete.
+        shtc3_present();
         return;
     }
 
@@ -91,6 +172,12 @@ void sensor_task(void *arg)
 {
     (void)arg;
 
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_BUS_SETTLE_MS));
+
+    // Every boot, so a unit that stops reporting can be diagnosed from its log
+    // alone rather than by attaching a debugger.
+    sensor_scan_bus();
+
     for (;;)
     {
         sensor_sample();
@@ -122,13 +209,9 @@ void sensor_ctrl::start()
         return;
     }
 
-    // Informational only. The rail may still be settling this early, so the
-    // sampling task keeps retrying rather than disabling the sensor outright.
-    if (!shtc3_present())
-    {
-        ESP_LOGW(TAG, "SHTC3: nothing at 0x%02X yet, will keep retrying", I2C_SHTC3_DEV_Address);
-    }
-
+    // Presence is not checked here: the bus is milliseconds old and the audio
+    // codec is about to start driving it. The sampling task sweeps the whole bus
+    // once the rail has settled, which covers 0x70 anyway.
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 3, NULL);
 }
 
