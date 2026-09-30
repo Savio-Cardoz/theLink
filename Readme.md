@@ -27,6 +27,7 @@ package and already contains:
 | Speaker | Plays sound files |
 | Microphone | (available for future projects) |
 | microSD reader | Stores images and sounds on a card |
+| SHTC3 temperature + humidity sensor | Reports the air around it, every 5 minutes |
 
 **Additional**
 
@@ -410,8 +411,8 @@ Query the device for its status, what is its state.
 ```
 
 - **You should see:** a reply on `evt/status` (section 6) with the current
-  firmware version, the LED pattern, the image on the e-paper, and a few
-  supporting details.
+  firmware version, the LED pattern, the image on the e-paper, the latest
+  temperature and humidity reading, and a few supporting details.
 
 The command takes no fields — it is a bare query, so an empty message is fine.
 Nothing is changed by sending it, and the reply is **not** retained.
@@ -456,16 +457,62 @@ gets the latest state — no need to wait.
 
 `status` is one of `started`, `downloaded`, `rebooting`, or `failed`.
 
+### `evt/sensor` — temperature and humidity (retained)
+
+The built-in SHTC3 sensor takes a reading shortly after boot and then every
+5 minutes. The message is **retained**, so a dashboard that subscribes at any
+time immediately gets the most recent reading instead of waiting for the next
+one, and the device re-publishes it every time it reconnects to the broker.
+
+- **Topic:** `thelink/0A1B2C3D4E5F/evt/sensor`
+
+```json
+{
+  "temperature_c": 24.31,
+  "humidity_pct": 41.19,
+  "age_ms": 12430
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `temperature_c` | number \| null | Air temperature in degrees Celsius |
+| `humidity_pct` | number \| null | Relative humidity, 0-100 |
+| `age_ms` | number | How long ago this reading was taken. Absent when there is no reading |
+
+This topic is **publish-only** — there is no `cmd/sensor` command, because
+there is nothing to configure about a thermohygrometer. To read the value right
+now, use `cmd/status` (section 5.7), which folds the same numbers into its
+`sensor` object.
+
+If a read fails (sensor not yet powered, bus error, or a bad checksum) the
+device logs a warning and keeps the previous reading rather than publishing a
+blank one, so a stale number is never silently replaced by `null`. The
+temperature and humidity fields are `null` only until the very first successful
+sample. Each read is attempted three times before the cycle gives up, and the
+first attempt is held back until about two seconds after boot so it does not
+race the audio codec coming up on the same I2C bus.
+
+At boot the driver also reads the sensor's ID register and logs it, e.g.
+`SHTC3: ID 0x0910 (CRC ok)`. That is the quickest way to tell a working sensor
+from a dead one: no ID line, or a CRC failure, means the part never identified
+itself. See the troubleshooting table (section 7).
+
 ### `evt/status` — answer to `cmd/status`
 
 - **Topic:** `thelink/0A1B2C3D4E5F/evt/status`
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "rgb_pattern": "rainbow_cycle",
   "image": "/sdcard/dog.bin",
   "device_id": "0A1B2C3D4E5F",
+  "sensor": {
+    "temperature_c": 24.31,
+    "humidity_pct": 41.19,
+    "age_ms": 12430
+  },
   "partition": "ota_0",
   "uptime_ms": 128430,
   "free_heap": 214032,
@@ -480,6 +527,7 @@ gets the latest state — no need to wait.
 | `rgb_pattern` | string | LED pattern currently selected — one of `off`, `solid_color`, `rainbow_cycle`, `theater_chase`, `color_wipe`, `scanner`, `fade` |
 | `image` | string \| null | Full SD path of the image **currently on the e-paper**, or `null` if nothing has been rendered yet |
 | `device_id` | string | Same device ID you used in the topic |
+| `sensor` | object | Cached temperature and humidity — `temperature_c`, `humidity_pct`, and `age_ms`. `null` values until the first sample succeeds. Same contents as `evt/sensor` |
 | `partition` | string \| null | App partition being executed (`ota_0` in a production build) |
 | `uptime_ms` | number | Milliseconds since boot |
 | `free_heap` | number | Free internal heap, in bytes |
@@ -490,6 +538,9 @@ gets the latest state — no need to wait.
 so it never claims to be showing an image that failed to download or render.
 It starts out as `null` after a reboot and fills in once the e-paper has been
 drawn.
+
+`sensor` is a cache, not a live read: asking for the status never blocks on I2C,
+so it stays fast. Use `age_ms` to tell a fresh reading from one taken at boot.
 
 ### `evt/log` — the device's diary
 
@@ -516,6 +567,7 @@ drawn.
 | Nothing happens / no `evt/led` reply | Wrong device ID in the topic, or the broker address doesn't match. Verify the device ID in the boot log |
 | Image doesn't show | Convert it first with `python3 scripts/png_to_epaper.py` — it must be LVGL I8, 200x200, with a 256-colour palette, and hosted on your own HTTP server |
 | Sound doesn't play | File must exist on the SD card (use `"download": ""` for a file already there) |
+| `evt/sensor` never arrives | Start with `ID 0x….  (CRC ok)` and `SHTC3 attached at 0x70`, then the `I2C scan on SDA 47 / SCL 48:` line printed about two seconds after boot. The scan names every device that answered: `0x18` ES8311, `0x51` PCF85063 RTC, `0x70` SHTC3. A missing `0x70`, or an `ID read 0xEFC8 NACKed at 0x70` at attach, is hardware — the sensor never identified itself. If the ID verifies but a read still fails, `measurement command 0x7866 NACKed at 0x70` means it answered the probe and the identity read but not the measurement, and `CRC mismatch` means the bus is noisy. A read is retried three times per cycle, then left to the next 5-minute tick |
 
 ---
 
@@ -658,6 +710,13 @@ format.
 ## 9. Version history
 
 ### v0.4.0
+- On-board SHTC3 temperature and humidity sensor
+- New retained `evt/sensor` event, published at boot and then every 5 minutes,
+  and re-published on every MQTT reconnect
+- `cmd/status` now includes the cached reading in a `sensor` object
+- New shared `i2c_bsp` component owning the board I2C bus, so the codec and the
+  sensor share one bus instead of each creating their own
+- Failed sensor reads keep the last good reading rather than publishing `null`
 - MQTT broker settings asked for at build time: the broker URL
   (`CONFIG_BROKER_URL`) and its credentials (`CONFIG_MQTT_USERNAME` /
   `CONFIG_MQTT_PASSWORD`), sent to the broker on connect

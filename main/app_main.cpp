@@ -24,6 +24,7 @@
 #include "led_ctrl.hpp"
 #include "ota_ctrl.hpp"
 #include "provisioning.hpp"
+#include "sensor_ctrl.hpp"
 #include "status_ctrl.hpp"
 #include "ui_port.hpp"
 
@@ -74,6 +75,7 @@ extern "C" void app_main(void)
 	audio_ctrl::init();
 	ota_ctrl::init();
 	status_ctrl::init();
+	sensor_ctrl::init();
 
 	user_app_init();
 	user_app_display_init();
@@ -168,6 +170,11 @@ extern "C" void app_main(void)
 	led_ctrl::start();
 	display_ctrl::start();
 	xTaskCreate(ui_overlay_task, "ui_overlay", 4096, NULL, 4, NULL);
+
+	// Must run before audio_ctrl::start(): the codec board support installs the
+	// I2C bus itself when it finds none, so the first caller wins. Claiming it
+	// here, on the app_main task, keeps that single-threaded.
+	sensor_ctrl::start();
 	audio_ctrl::start();
 
 	// =================================================================
