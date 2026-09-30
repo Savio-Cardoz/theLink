@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 
@@ -61,6 +62,33 @@ static void publish_status(void)
 	else
 	{
 		cJSON_AddNullToObject(root, "partition");
+	}
+
+	// SD card capacity. Reported as null when there is no card, or when the
+	// volume is mounted but will not answer — a missing card must never be
+	// mistaken for a full one.
+	uint64_t sdTotal = 0;
+	uint64_t sdFree = 0;
+	IFileSystem *sdcard = app::sdcard();
+	if (sdcard != nullptr && sdcard->getSpaceInfo(sdTotal, sdFree))
+	{
+		cJSON *sd = cJSON_CreateObject();
+		if (sd == nullptr)
+		{
+			ESP_LOGE(TAG, "Out of memory building the sdcard status object");
+			cJSON_AddNullToObject(root, "sdcard");
+		}
+		else
+		{
+			cJSON_AddBoolToObject(sd, "mounted", 1);
+			cJSON_AddNumberToObject(sd, "total_bytes", (double)sdTotal);
+			cJSON_AddNumberToObject(sd, "free_bytes", (double)sdFree);
+			cJSON_AddItemToObject(root, "sdcard", sd);
+		}
+	}
+	else
+	{
+		cJSON_AddNullToObject(root, "sdcard");
 	}
 
 	cJSON_AddNumberToObject(root, "uptime_ms", (double)(esp_timer_get_time() / 1000));
