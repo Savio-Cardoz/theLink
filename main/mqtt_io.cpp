@@ -121,6 +121,17 @@ void mqtt_io_start(void)
 	mqtt5_cfg.broker.address.uri = CONFIG_BROKER_URL;
 	mqtt5_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
 
+	// Credentials are supplied at build time (see CONFIG_MQTT_USERNAME in
+	// Kconfig.projbuild). esp-mqtt omits the username/password fields from the
+	// CONNECT packet when these are empty, so an unset pair means "connect
+	// anonymously" rather than "send an empty username".
+	mqtt5_cfg.credentials.username = CONFIG_MQTT_USERNAME;
+	mqtt5_cfg.credentials.authentication.password = CONFIG_MQTT_PASSWORD;
+	if (CONFIG_MQTT_USERNAME[0] == '\0')
+	{
+		ESP_LOGW(TAG, "No MQTT username configured, connecting to %s anonymously", CONFIG_BROKER_URL);
+	}
+
 	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
 	app::set_mqtt(client);
 

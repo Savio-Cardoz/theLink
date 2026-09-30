@@ -112,6 +112,10 @@ Topics come in two flavours:
 
 4. The ring goes rainbow. First message delivered
 
+If you built the firmware with a broker URL or credentials (see
+[MQTT broker settings](#mqtt-broker-settings)), MQTTX has to point at the same
+broker, with the same username and password.
+
 ---
 
 ## 4. Find the device ID
@@ -583,10 +587,88 @@ Build-time options in `menuconfig` (`Example Configuration`):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `CONFIG_BROKER_URL` | `mqtt://broker.emqx.io` | MQTT broker address |
+| `CONFIG_MQTT_USERNAME` | `""` | MQTT username (usually set at build time, see below) |
+| `CONFIG_MQTT_PASSWORD` | `""` | MQTT password (usually set at build time, see below) |
+
+#### MQTT broker settings
+
+The first time you build, `scripts/build.py` asks for the broker URL and its
+credentials and remembers them:
+
+```
+Broker URL [mqtt://broker.emqx.io]: mqtts://my-broker.example.com:8883
+MQTT username: thelink
+MQTT password: ********
+Confirm password: ********
+  broker url      : mqtts://my-broker.example.com:8883 (the prompt)
+  mqtt username   : thelink (the prompt)
+  saved to        : sdkconfig.secrets
+```
+
+They are stored in `sdkconfig.secrets`, a Kconfig overlay that the build appends
+to `SDKCONFIG_DEFAULTS`. The file is gitignored, so the credentials never reach
+the repository. Later builds read it silently — you answer the prompt once.
+
+| Setting | Kconfig option | Environment variable |
+|---------|----------------|----------------------|
+| Broker URL | `CONFIG_BROKER_URL` | `THELINK_BROKER_URL` |
+| Username | `CONFIG_MQTT_USERNAME` | `THELINK_MQTT_USERNAME` |
+| Password | `CONFIG_MQTT_PASSWORD` | `THELINK_MQTT_PASSWORD` |
+
+All three are ordinary menuconfig options as well, so you can set them by hand
+if you prefer. **Leaving a field empty means "not specified"**: that field is
+not written to the overlay and the menuconfig value keeps applying. The Broker
+URL prompt is pre-filled with the URL the last build used, so pressing Enter
+leaves your menuconfig broker alone rather than pinning a copy of it. A typed
+URL is checked before it is accepted — it needs a host and one of the four
+schemes esp-mqtt understands (`mqtt`, `mqtts`, `ws`, `wss`) — so a typo fails
+at build time rather than on the device.
+
+**Skipping the prompt is fine.** Press Enter at the username prompt and the
+build carries on with no credentials, exactly as firmware before v0.4.0 did —
+which is what an unauthenticated public broker such as `broker.emqx.io` wants.
+The firmware logs a warning at boot and connects anonymously; a broker that
+requires authentication will refuse the connection.
+
+```bash
+# Change the broker settings later
+python3 scripts/build.py --reprompt
+
+# Never be asked: use the cache if there is one, menuconfig if not
+python3 scripts/build.py --no-prompt
+
+# Supply them non-interactively (CI, scripted builds)
+THELINK_BROKER_URL=mqtts://broker:8883 THELINK_MQTT_USERNAME=thelink \
+  THELINK_MQTT_PASSWORD=... python3 scripts/build.py
+```
+
+Environment variables take precedence over the cached file, and
+`sdkconfig.secrets` is rewritten to match whichever source won, so the file
+always reflects the last build. `sdkconfig.secrets.example` documents the file
+format.
+
+> **Note:** the settings are compiled into the firmware, and also land in
+> `build*/sdkconfig` and `build*/config/sdkconfig.h` (both gitignored). Treat
+> the built binary as sensitive. Credentials alone are not much use over the
+> wire — point `CONFIG_BROKER_URL` at an `mqtts://` endpoint to get TLS as
+> well.
 
 ---
 
 ## 9. Version history
+
+### v0.4.0
+- MQTT broker settings asked for at build time: the broker URL
+  (`CONFIG_BROKER_URL`) and its credentials (`CONFIG_MQTT_USERNAME` /
+  `CONFIG_MQTT_PASSWORD`), sent to the broker on connect
+- `scripts/build.py` asks for them on the first build and caches them in the
+  gitignored `sdkconfig.secrets`; an empty answer leaves that setting to
+  menuconfig
+- `scripts/build.py --reprompt` to change them, `--no-prompt` to never be asked,
+  and `THELINK_BROKER_URL` / `THELINK_MQTT_USERNAME` / `THELINK_MQTT_PASSWORD`
+  to supply them non-interactively
+- Credentials stay optional: skipping the prompt builds firmware that connects
+  anonymously, as before, and says so in the log
 
 ### v0.3.1
 - `cmd/status` device-status query: firmware version, current LED pattern and

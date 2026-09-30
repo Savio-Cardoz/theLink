@@ -9,6 +9,16 @@ TheLink build-profile switch. Dev is the default: a plain
     Prod : production partition table for OTA via esp32_factory_app
            (partitions.csv). Build dir: build
 
+Every build that produces a binary also asks for the MQTT broker settings - the
+broker URL and its credentials - the first time, and caches them in the
+gitignored sdkconfig.secrets (see mqtt_secrets.py). Answer the prompt once and
+every later build reuses the cache. Skipping the prompt is fine: the broker URL
+then comes from menuconfig and the firmware connects anonymously, exactly as it
+did before. Use --reprompt to change the settings, --no-prompt to never be asked
+(for CI or for a scripted build), or set THELINK_BROKER_URL,
+THELINK_MQTT_USERNAME and THELINK_MQTT_PASSWORD to supply them
+non-interactively.
+
 idf.py is launched with the ESP-IDF Python interpreter (see idf_env.py). Run
 this from any terminal; running the ESP-IDF export script first is optional.
 
@@ -20,6 +30,8 @@ Examples:
     python3 scripts/build.py -p Prod flash
     python3 scripts/build.py -p Dev menuconfig
     python3 scripts/build.py -p Dev --clean
+    python3 scripts/build.py --reprompt      # ask for new MQTT credentials
+    python3 scripts/build.py --no-prompt     # fail soft, never prompt
 """
 
 import argparse
@@ -29,6 +41,7 @@ import subprocess
 import sys
 
 import idf_env
+import mqtt_secrets as secrets
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,6 +114,14 @@ def main():
                         help="idf.py action, e.g. build, flash, menuconfig (default: build)")
     parser.add_argument("--port", default=os.environ.get("ESPPORT"),
                         help="Serial port (default: $ESPPORT)")
+    parser.add_argument("--reprompt", action="store_true",
+                        help="Ask for the MQTT credentials again, replacing the "
+                             "ones cached in %s" % secrets.SECRETS_BASENAME)
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="Never ask for the MQTT credentials. Use the "
+                             "environment variables or the cached %s, and build "
+                             "anonymously if there are none"
+                             % secrets.SECRETS_BASENAME)
     parser.add_argument("--clean", action="store_true",
                         help="idf.py fullclean the build dir first")
     parser.add_argument("idf_args", nargs="*",
@@ -120,7 +141,17 @@ def main():
     print("  interpreter      : %s" % invoke[0])
     print("  idf.py           : %s" % invoke[-1])
 
+    # A bare fullclean throws the build away and creates no binary, so there is
+    # nothing for the broker settings to go into.
     build_dir = profile["build_dir"]
+    defaults_spec = profile["sdkconfig_defaults"]
+    if args.action != "fullclean":
+        settings = secrets.resolve(os.path.join(build_dir, "sdkconfig"),
+                                   allow_prompt=not args.no_prompt,
+                                   force_prompt=args.reprompt)
+        if settings:
+            defaults_spec = "%s;%s" % (defaults_spec, secrets.SECRETS_BASENAME)
+            print("  sdkconfig        : %s" % defaults_spec)
 
     if args.clean:
         print("Cleaning %s" % build_dir)
@@ -130,12 +161,12 @@ def main():
         if rc != 0:
             sys.exit(rc)
 
-    sdkconfig = ensure_sdkconfig(build_dir, profile["sdkconfig_defaults"])
+    sdkconfig = ensure_sdkconfig(build_dir, defaults_spec)
     print("  sdkconfig file   : %s" % sdkconfig)
 
     cmd = invoke + ["-B", build_dir,
                     "-DSDKCONFIG=%s" % sdkconfig,
-                    "-DSDKCONFIG_DEFAULTS=%s" % profile["sdkconfig_defaults"]]
+                    "-DSDKCONFIG_DEFAULTS=%s" % defaults_spec]
     if args.port:
         cmd += ["-p", args.port]
     cmd += args.idf_args
