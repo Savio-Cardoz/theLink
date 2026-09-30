@@ -4,7 +4,34 @@ menu "Example Configuration"
         string "Broker URL"
         default "mqtt://broker.emqx.io"
         help
-            URL of the broker to connect to
+            URL of the broker to connect to, with a scheme: mqtt:// or mqtts://
+            for TLS, ws:// or wss:// over a WebSocket.
+
+            scripts/build.py asks for this at build time along with the
+            credentials, and writes the answer to the gitignored
+            sdkconfig.secrets. This option stays the source of truth whenever
+            that file does not name a broker URL.
+
+    config MQTT_USERNAME
+        string "MQTT username"
+        default ""
+        help
+            Username sent to the broker. Leave empty to connect anonymously
+            (e.g. a public broker with no authentication).
+
+            scripts/build.py normally asks for this at build time and caches the
+            answer in the gitignored sdkconfig.secrets, so it rarely needs to be
+            set by hand here. Setting it in menuconfig works too, but the value
+            is then written into build*/sdkconfig.
+
+    config MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            Password sent to the broker. Only meaningful when MQTT_USERNAME is
+            set; esp-mqtt omits the password from the CONNECT packet otherwise.
+
+            See MQTT_USERNAME for how this is normally supplied.
     
     choice EXAMPLE_PROV_TRANSPORT
         bool "Provisioning Transport"
