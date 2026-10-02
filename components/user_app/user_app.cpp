@@ -6,6 +6,7 @@
 #include "board_power_bsp.h"
 #include "gui_guider.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_err.h"
 #include "lvgl.h"
 
@@ -18,6 +19,8 @@ board_power_bsp_t board_div(EPD_PWR_PIN, Audio_PWR_PIN, VBAT_PWR_PIN);
 lv_ui src_ui;
 lv_obj_t *dynamic_epd_image = NULL;
 extern lv_display_t *disp;
+
+static uint8_t *epd_static_buffer = nullptr;
 
 void user_app_init(void)
 {
@@ -34,7 +37,9 @@ void user_app_init(void)
     driver_config.scl = EPD_SCK_PIN;
     driver_config.spi_host = EPD_SPI_NUM;
     driver_config.buffer_len = 5000;
-    driver = new epaper_driver_display(EPD_WIDTH, EPD_HEIGHT, driver_config);
+    epd_static_buffer = (uint8_t *)heap_caps_malloc(5000, MALLOC_CAP_SPIRAM);
+    assert(epd_static_buffer != NULL);
+    driver = new epaper_driver_display(EPD_WIDTH, EPD_HEIGHT, driver_config, epd_static_buffer);
 }
 
 static void epd_display_init_task(void *arg)

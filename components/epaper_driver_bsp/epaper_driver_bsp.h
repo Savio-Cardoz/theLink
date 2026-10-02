@@ -53,7 +53,8 @@ private:
     void EPD_TurnOnDisplayPart();
 
 public:
-    epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data);
+    epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data);
+    epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data, uint8_t *external_buffer);
     ~epaper_driver_display();
 
     void EPD_Init();    /* 墨水屏初始化 */

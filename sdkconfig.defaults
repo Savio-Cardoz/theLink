@@ -35,3 +35,15 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=3
 # Re-query often enough that a unit left running picks up a corrected time
 # rather than holding a day's worth of drift.
 CONFIG_LWIP_SNTP_UPDATE_DELAY=3600000
+
+# Memory optimization to reduce heap pressure during provisioning
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
+CONFIG_BT_GATTC_ENABLE=n
+
+# Reduce TCP receive mailbox size to save heap
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=5
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y

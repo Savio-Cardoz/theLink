@@ -147,7 +147,8 @@ static void display_update_task(void *arg)
 				}
 				else
 				{
-					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed.");
+					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed (40KB in SPIRAM).");
+					if (f != NULL) fclose(f);
 				}
 
 				if (f != NULL) fclose(f);

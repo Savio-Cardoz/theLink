@@ -68,7 +68,7 @@ unsigned char WF_PARTIAL_1IN54_0[159] =
     0x02,0x17,0x41,0xB0,0x32,0x28,
 };
 
-epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data) : 
+epaper_driver_display::epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data) : 
     lcd_spi_data(_lcd_spi_data),
     Width(width),
     Height(height) {
@@ -79,6 +79,19 @@ epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_sp
 
     buffer = (uint8_t *)heap_caps_malloc(lcd_spi_data.buffer_len, MALLOC_CAP_SPIRAM);
 	assert(buffer);
+}
+
+epaper_driver_display::epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data, uint8_t *external_buffer) : 
+    lcd_spi_data(_lcd_spi_data),
+    Width(width),
+    Height(height) {
+
+    ESP_LOGI(TAG, "Initialize SPI (external buffer)");
+	spi_port_init();
+	spi_gpio_init();
+
+    buffer = external_buffer;
+	assert(buffer != NULL);
 }
 
 epaper_driver_display::~epaper_driver_display() {

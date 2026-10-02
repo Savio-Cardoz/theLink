@@ -170,19 +170,17 @@ extern "C" void app_main(void)
 		ui_unlock();
 	}
 
-	// 2. Only now that the UI is locked in, allow provisioning to push its
-	//    QR overlay onto the screen.
-	provisioning_start();
-
-	download::log_heap_info("after provisioning_start");
-
+	// 2. Start display/UI tasks BEFORE provisioning to reduce heap pressure
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
-	// Led Task has low priority so it doesn't interfere with the UI and display tasks
 	led_ctrl::start();
 	display_ctrl::start();
 	xTaskCreate(ui_overlay_task, "ui_overlay", 4096, NULL, 4, NULL);
-
 	download::log_heap_info("after display_ctrl::start");
+	display_ctrl::boot_kick_if_active();
+
+	// 3. Now start provisioning (WiFi/BLE) after display is ready
+	provisioning_start();
+	download::log_heap_info("after provisioning_start");
 
 	// Must run before audio_ctrl::start(): the codec board support installs the
 	// I2C bus itself when it finds none, so the first caller wins. Claiming it
@@ -194,9 +192,4 @@ extern "C" void app_main(void)
 	// timezone it restores is not overwritten by the compiled-in default. The RTC
 	// is on the same bus sensor_ctrl just claimed, so it comes second.
 	time_ctrl::start();
-
-	// =================================================================
-	// 3. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready
-	// =================================================================
-	display_ctrl::boot_kick_if_active();
 }
