@@ -819,8 +819,7 @@ format.
 ---
 
 ## 9. Version history
-
-### v0.4.0
+### v0.4.1
 - Time synchronization over SNTP (`pool.ntp.org`), re-checked hourly
 - On-board PCF85063 real-time clock, read at boot to seed the system clock and
   rewritten from SNTP on every sync, so a unit that reboots without a network
@@ -838,6 +837,8 @@ format.
   `config.json` so it survives a reboot
 - `THELINK_TZ` build option as a factory default for a unit never told otherwise;
   the stored timezone wins over it
+
+### v0.4.0
 - On-board SHTC3 temperature and humidity sensor
 - New retained `evt/sensor` event, published at boot and then every 5 minutes,
   and re-published on every MQTT reconnect
