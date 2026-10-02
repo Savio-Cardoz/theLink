@@ -42,6 +42,7 @@ static void epd_display_init_task(void *arg)
     ESP_LOGI("EPD", "e-paper init task started (background)");
     driver->EPD_Init();
     driver->EPD_Clear();
+    driver->EPD_LogHeap("boot EPD init (working baseline)");
     ESP_LOGI("EPD", "e-paper ready");
     vTaskDelete(NULL);
 }

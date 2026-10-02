@@ -65,5 +65,7 @@ public:
     void EPD_Init_Partial();
     void EPD_DisplayPart();
     void EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t color);
+
+    void EPD_LogHeap(const char *context);
 };
 #endif

@@ -101,11 +101,13 @@ void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *c
 	if (is_full_refresh)
 	{
 		// Prime the controller for a FULL global blink cycle (prevents panel ghosting)
+		driver->EPD_LogHeap("flush: before EPD_Init");
 		driver->EPD_Init();
 	}
 	else
 	{
 		// Prime the controller for a silent, ultra-fast PARTIAL update loop
+		driver->EPD_LogHeap("flush: before EPD_Init_Partial");
 		driver->EPD_Init_Partial();
 	}
 

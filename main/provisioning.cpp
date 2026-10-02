@@ -177,6 +177,9 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
     int qr_size = esp_qrcode_get_size(qrcode);
     const int display_dim = 200;
 
+    ESP_LOGI("QR_UI", "callback entered: qr_size=%d, SPIRAM free=%u",
+             qr_size, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     int scale = display_dim / qr_size;
     if (scale < 1) scale = 1;
 
@@ -193,6 +196,9 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
         ESP_LOGE("QR_UI", "External frame allocation breakdown for QR matrix layer!");
         return;
     }
+
+    ESP_LOGI("QR_UI", "qr_pixel_buffer=%p, scale=%d, offset=(%d,%d)",
+             (void *)qr_pixel_buffer, scale, offset_x, offset_y);
 
     uint16_t *rgb565_dest = (uint16_t *)qr_pixel_buffer;
     for (int i = 0; i < (display_dim * display_dim); i++) {
@@ -225,7 +231,10 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
     qr_dynamic_bmp.data_size = RGB565_SIZE;
     qr_dynamic_bmp.data = qr_pixel_buffer;
 
-    if (ui_lock(-1)) {
+    bool locked = ui_lock(-1);
+    ESP_LOGI("QR_UI", "ui_lock returned %d", locked);
+
+    if (locked) {
         if (qr_image_obj == NULL) {
             qr_image_obj = lv_image_create(lv_screen_active());
         }

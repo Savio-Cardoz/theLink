@@ -20,6 +20,7 @@
 #include "audio_ctrl.hpp"
 #include "config_store.hpp"
 #include "display_ctrl.hpp"
+#include "download_mgr.hpp"
 #include "identity.hpp"
 #include "led_ctrl.hpp"
 #include "ota_ctrl.hpp"
@@ -82,6 +83,8 @@ extern "C" void app_main(void)
 	user_app_init();
 	user_app_display_init();
 
+	download::log_heap_info("after user_app_init");
+
 	bool dynamic_factory_reset = check_reset_button_at_boot();
 
 	if (dynamic_factory_reset)
@@ -115,8 +118,12 @@ extern "C" void app_main(void)
 		ESP_LOGE(TAG, "Failed to mount SD card. Check the connections and try again.");
 	}
 
+	download::log_heap_info("after SD mount + config_store_load");
+
 	/* Epaper display initialization */
 	ui_port_init();
+
+	download::log_heap_info("after ui_port_init");
 
 	/* Initialize NVS partition */
 	esp_err_t ret = nvs_flash_init();
@@ -167,11 +174,15 @@ extern "C" void app_main(void)
 	//    QR overlay onto the screen.
 	provisioning_start();
 
+	download::log_heap_info("after provisioning_start");
+
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
 	// Led Task has low priority so it doesn't interfere with the UI and display tasks
 	led_ctrl::start();
 	display_ctrl::start();
 	xTaskCreate(ui_overlay_task, "ui_overlay", 4096, NULL, 4, NULL);
+
+	download::log_heap_info("after display_ctrl::start");
 
 	// Must run before audio_ctrl::start(): the codec board support installs the
 	// I2C bus itself when it finds none, so the first caller wins. Claiming it
