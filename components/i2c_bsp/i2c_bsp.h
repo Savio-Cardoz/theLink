@@ -45,11 +45,19 @@ extern "C"
     // the bus itself is at fault. Probes a quiet bus take well under a millisecond
     // each, so a full sweep costs a few milliseconds of bus time.
     //
-    // A bus held low by a shorted or unpowered device makes every probe time out;
-    // the sweep then stops at the first address and reports ESP_ERR_TIMEOUT so the
-    // caller can say so instead of reporting an empty bus.
+    // A bus held low by a shorted or unpowered device makes every probe time out.
+    // The driver uses ESP_ERR_TIMEOUT both for that and for losing the race to another
+    // task already on the bus, so the sweep tolerates a few consecutive timeouts
+    // before concluding the bus is stuck, and then stops and reports
+    // ESP_ERR_TIMEOUT. Otherwise a brief conflict with the codec would be reported as
+    // a wiring fault.
+    //
+    // Every probed address is logged, hits at debug level and the totals at info, so
+    // a truncated or empty sweep is distinguishable from a device that is genuinely
+    // absent.
     //
     // Returns ESP_OK even when nothing answers, with *found_count left at 0.
+    // Returns ESP_ERR_INVALID_SIZE when more than found_cap devices answer.
     // Returns ESP_ERR_INVALID_ARG on a bad range or a NULL buffer, and
     // ESP_ERR_INVALID_STATE when i2c_bsp_init() has not installed a bus yet.
     esp_err_t i2c_bsp_scan(uint8_t port, uint8_t first_addr, uint8_t last_addr,

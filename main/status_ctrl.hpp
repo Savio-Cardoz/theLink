@@ -12,4 +12,10 @@ void init(void);
 // MQTT command handler (registered on the status topic).
 void handle_status_command(const char *payload);
 
+// Publish a full status snapshot. This is the only writer to evt/status:
+// cmd/status calls it, and so does anything that changed a value the reply
+// carries (a completed time sync, a reconnect), so subscribers are not left
+// holding a snapshot taken before that change.
+void publish(void);
+
 } // namespace status_ctrl

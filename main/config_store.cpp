@@ -8,6 +8,7 @@
 #include "config_store.hpp"
 #include "display_ctrl.hpp"
 #include "led_ctrl.hpp"
+#include "time_ctrl.hpp"
 
 static const char *TAG = "CONFIG";
 
@@ -26,6 +27,14 @@ void config_store_save(void)
 		cJSON *led = cJSON_CreateObject();
 		led_ctrl::status_serialize(led);
 		cJSON_AddItemToObject(root, "led", led);
+	}
+
+	// Declared timezone, so a unit that was told where it is stays that way
+	// across reboots. Null when it never was.
+	{
+		cJSON *time = cJSON_CreateObject();
+		time_ctrl::config_serialize(time);
+		cJSON_AddItemToObject(root, "time", time);
 	}
 
 	char *json_str = cJSON_Print(root);
@@ -92,6 +101,13 @@ void config_store_load(void)
 				{
 					led_ctrl::status_apply(led_item);
 				}
+			}
+
+			// Parse and apply the declared timezone
+			cJSON *time_item = cJSON_GetObjectItemCaseSensitive(json, "time");
+			if (cJSON_IsObject(time_item))
+			{
+				time_ctrl::config_apply(time_item);
 			}
 
 			cJSON_Delete(json);

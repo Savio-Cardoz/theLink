@@ -2,6 +2,8 @@
 
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "i2c_bsp.h"
 
@@ -19,6 +21,13 @@ static const char *DRIVER_TAG = "i2c.master";
 // A probe of a present device finishes in a few hundred microseconds, so this
 // only ever gets spent when a device holds the bus down.
 #define I2C_BSP_SCAN_TIMEOUT_MS 20
+
+// How many addresses must time out back to back before the sweep concludes the bus
+// is stuck rather than busy. The driver reports "bus mutex unavailable" and "SDA
+// held low" with the same error, and only the second is a wiring fault. A busy bus
+// clears within one or two addresses, so a short run separates the two cases without
+// needing to hold the bus quiet for longer than the sweep itself.
+#define I2C_BSP_SCAN_STUCK_RUN 3
 
 static i2c_master_bus_handle_t s_bus[I2C_BSP_MAX_PORTS];
 static bool s_installed[I2C_BSP_MAX_PORTS];
@@ -126,26 +135,66 @@ esp_err_t i2c_bsp_scan(uint8_t port, uint8_t first_addr, uint8_t last_addr,
     esp_log_level_set(DRIVER_TAG, ESP_LOG_NONE);
 
     esp_err_t ret = ESP_OK;
+    size_t probed = 0;
+    size_t nacked = 0;
+    size_t timeouts = 0;
+    unsigned consecutive_timeouts = 0;
+
     for (unsigned addr = first_addr; addr <= last_addr; addr++)
     {
+        // The driver takes the bus mutex for the probe, so a codec write or a sensor
+        // read still in flight makes the probe wait. Waits for that here rather
+        // than reporting the resulting timeout as a missing device.
+        (void)i2c_master_bus_wait_all_done(s_bus[port], pdMS_TO_TICKS(I2C_BSP_SCAN_TIMEOUT_MS));
+
         const esp_err_t err = i2c_master_probe(s_bus[port], (uint16_t)addr, I2C_BSP_SCAN_TIMEOUT_MS);
+        probed++;
         if (err == ESP_OK)
         {
+            consecutive_timeouts = 0;
+            ESP_LOGD(TAG, "0x%02X acknowledged", addr);
             if (*found_count < found_cap)
             {
                 found[(*found_count)++] = (uint8_t)addr;
             }
+            else
+            {
+                // Not fatal, but the list is now incomplete, so a reader must not
+                // treat it as proof the bus holds nothing else.
+                ESP_LOGW(TAG, "more than %zu devices answered, the list is truncated", found_cap);
+                ret = ESP_ERR_INVALID_SIZE;
+            }
             continue;
         }
+
         if (err == ESP_ERR_TIMEOUT)
         {
-            // Nothing that answers within 20 ms means the bus itself is stuck,
-            // not that a single device is absent: sweeping on would only burn
-            // 20 ms per address to reach the same conclusion.
-            ret = ESP_ERR_TIMEOUT;
-            break;
+            // The driver reports a bus mutex timeout as ESP_ERR_TIMEOUT too, so this
+            // is not on its own evidence of a broken bus. Only a run of them is: a
+            // genuine stuck-bus fault keeps timing out at every address, whereas a
+            // busy bus recovers.
+            timeouts++;
+            consecutive_timeouts++;
+            ESP_LOGD(TAG, "0x%02X timed out (bus busy, or held low)", addr);
+            if (consecutive_timeouts >= I2C_BSP_SCAN_STUCK_RUN)
+            {
+                ret = ESP_ERR_TIMEOUT;
+                break;
+            }
+            continue;
         }
+
+        consecutive_timeouts = 0;
+        nacked++;
+        ESP_LOGD(TAG, "0x%02X did not acknowledge", addr);
     }
+
+    // Every result, not just the hits. A sweep that reports five addresses is
+    // indistinguishable from one that silently stopped early unless the misses are
+    // visible too, which is what makes an absent device tellable apart from a probe
+    // that never ran.
+    ESP_LOGI(TAG, "swept 0x%02X..0x%02X: %zu answered, %zu did not acknowledge, %zu timed out",
+             first_addr, last_addr, probed - nacked - timeouts, nacked, timeouts);
 
     esp_log_level_set(DRIVER_TAG, driver_level);
     return ret;
