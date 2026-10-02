@@ -5,7 +5,8 @@
 | Status | **Resolved** (verified working on device) |
 | Reported | 2026-10-02 |
 | Branch | `fixstuff` |
-| Baseline commit | `01c0f9a` ("untested" - adds heap instrumentation) |
+| Baseline commit | `5e73940` ("untested" - adds heap instrumentation) |
+| Fix commit | `8775c07` ("fix heap corruption") |
 | Known-good | `5fdabd4` ("Time keeping using NTP", on `origin/master`) |
 | Firmware version | `0.4.0` (`version.txt`) |
 
@@ -32,7 +33,7 @@ Two details made this confusing to diagnose:
 
 ## Reproduction
 
-1. Flash `01c0f9a` onto a device that is already provisioned and has a valid
+1. Flash `5e73940` onto a device that is already provisioned and has a valid
    `config.json` on the SD card pointing at an image (`dog.bin`).
 2. Hold the reset/provision button (GPIO3, active-low) at power-up.
 3. `check_reset_button_at_boot()` (`main/app_main.cpp:41`) fires and the
@@ -41,7 +42,7 @@ Two details made this confusing to diagnose:
 
 ## Investigation
 
-Commit `01c0f9a` was the attempt to identify the reason. It added heap
+Commit `5e73940` was the attempt to identify the reason. It added heap
 instrumentation rather than a fix:
 
 - `epaper_driver_bsp::EPD_LogHeap()` (`components/epaper_driver_bsp/epaper_driver_bsp.cpp:14`)
@@ -180,10 +181,31 @@ unchanged.
 
 ## Verification
 
-- `build-dev/theLink_esp32s3.bin` builds clean (3,948,800 bytes / 53% of the
-  app partition free), no new warnings introduced by these changes.
+- `build-dev/theLink_esp32s3.bin` builds clean, no new warnings introduced by
+  these changes.
 - On-device: the device boots and loads the binary images, including the
   re-provisioned state that previously produced the crash loop.
+
+### Rebase onto `master` (`5fdabd4`)
+
+The branch was rebased onto `master` after the fix was confirmed working. Both
+commits replayed with conflicts confined to `sdkconfig.defaults` and
+`main/app_main.cpp`. Resolutions:
+
+- `sdkconfig.defaults` - both sides had appended to the end of the file.
+  Kept **both** the `SNTP` block from `master` and this branch's memory
+  optimisation block. `5e73940` also deliberately dropped the
+  `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK` / `CONFIG_HEAP_POISONING_COMPREHENSIVE`
+  diagnostics, whose own comment said "remove after root-causing the crash";
+  that removal was honoured, so those two lines are absent.
+- `main/app_main.cpp` - kept `master`'s `time_ctrl::start()`, and dropped the
+  trailing "FIXED POSITION BOOT KICK" block, since `8775c07` had already moved
+  `display_ctrl::boot_kick_if_active()` ahead of `provisioning_start()`.
+  Keeping both would have kicked the display task twice.
+
+Post-rebase build: 3,960,528 bytes, 52% of the app partition free. Binaries
+built before the rebase are not directly comparable - `master` adds the NTP/RTC
+feature set - so the size change is expected.
 
 ## Residual risk
 
