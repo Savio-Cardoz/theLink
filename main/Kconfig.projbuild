@@ -1,3 +1,26 @@
+menu "TheLink"
+
+    config THELINK_TZ
+        string "Default timezone (POSIX)"
+        default ""
+        help
+            Timezone used to render local time in evt/status, as a POSIX TZ
+            string. Leave empty to report UTC only, with no local time.
+
+            This is NOT an IANA name. The C library in this build ships no
+            timezone database, so "Asia/Kolkata" resolves to nothing and the
+            offset silently stays at zero. Send the POSIX form instead, e.g.
+            "IST-5:30".
+
+            Mind the inverted sign: a POSIX offset is the time you ADD to local
+            time to reach UTC, so India (UTC+05:30) is -5:30.
+
+            Whatever is set here is only a factory default. A timezone sent to
+            cmd/timezone overrides it and is persisted to the SD card, and the
+            stored value wins on the next boot.
+
+endmenu
+
 menu "Example Configuration"
 
     config BROKER_URL

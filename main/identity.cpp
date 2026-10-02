@@ -15,6 +15,7 @@ static char s_mqtt_cmd_rgb_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_audio_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_notification_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_ota_topic[MQTT_TOPIC_MAX_LEN];
+static char s_mqtt_cmd_timezone_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_cmd_status_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_led_topic[MQTT_TOPIC_MAX_LEN];
 static char s_mqtt_evt_ota_topic[MQTT_TOPIC_MAX_LEN];
@@ -43,6 +44,8 @@ void identity_init(void)
 			 "thelink/%s/cmd/notification", s_device_id);
 	snprintf(s_mqtt_cmd_ota_topic, sizeof(s_mqtt_cmd_ota_topic),
 			 "thelink/%s/cmd/ota", s_device_id);
+	snprintf(s_mqtt_cmd_timezone_topic, sizeof(s_mqtt_cmd_timezone_topic),
+			 "thelink/%s/cmd/timezone", s_device_id);
 	snprintf(s_mqtt_cmd_status_topic, sizeof(s_mqtt_cmd_status_topic),
 			 "thelink/%s/cmd/status", s_device_id);
 	snprintf(s_mqtt_evt_led_topic, sizeof(s_mqtt_evt_led_topic),
@@ -61,6 +64,7 @@ void identity_init(void)
 	ESP_LOGI("DEVICE", "Audio cmd topic: %s", s_mqtt_cmd_audio_topic);
 	ESP_LOGI("DEVICE", "Notification cmd topic: %s", s_mqtt_cmd_notification_topic);
 	ESP_LOGI("DEVICE", "OTA cmd topic: %s", s_mqtt_cmd_ota_topic);
+	ESP_LOGI("DEVICE", "Timezone cmd topic: %s", s_mqtt_cmd_timezone_topic);
 	ESP_LOGI("DEVICE", "Status cmd topic: %s", s_mqtt_cmd_status_topic);
 	ESP_LOGI("DEVICE", "LED evt topic: %s", s_mqtt_evt_led_topic);
 	ESP_LOGI("DEVICE", "OTA evt topic: %s", s_mqtt_evt_ota_topic);
@@ -101,6 +105,11 @@ const char *identity_topic_cmd_notification(void)
 const char *identity_topic_cmd_ota(void)
 {
 	return s_mqtt_cmd_ota_topic;
+}
+
+const char *identity_topic_cmd_timezone(void)
+{
+	return s_mqtt_cmd_timezone_topic;
 }
 
 const char *identity_topic_cmd_status(void)

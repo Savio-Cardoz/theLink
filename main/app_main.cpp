@@ -26,6 +26,7 @@
 #include "provisioning.hpp"
 #include "sensor_ctrl.hpp"
 #include "status_ctrl.hpp"
+#include "time_ctrl.hpp"
 #include "ui_port.hpp"
 
 static const char *TAG = "app";
@@ -76,6 +77,7 @@ extern "C" void app_main(void)
 	ota_ctrl::init();
 	status_ctrl::init();
 	sensor_ctrl::init();
+	time_ctrl::init();
 
 	user_app_init();
 	user_app_display_init();
@@ -176,6 +178,11 @@ extern "C" void app_main(void)
 	// here, on the app_main task, keeps that single-threaded.
 	sensor_ctrl::start();
 	audio_ctrl::start();
+
+	// Must run after config_store_load() and after the event loop exists, so the
+	// timezone it restores is not overwritten by the compiled-in default. The RTC
+	// is on the same bus sensor_ctrl just claimed, so it comes second.
+	time_ctrl::start();
 
 	// =================================================================
 	// 3. FIXED POSITION BOOT KICK: Only wake display task AFTER UI is ready

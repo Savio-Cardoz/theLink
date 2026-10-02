@@ -28,6 +28,7 @@ package and already contains:
 | Microphone | (available for future projects) |
 | microSD reader | Stores images and sounds on a card |
 | SHTC3 temperature + humidity sensor | Reports the air around it, every 5 minutes |
+| PCF85063 real-time clock | Keeps the time across a restart, so a rebooted unit needs no network to know it. Runs on the board's 3v3 rail, so it does not survive a power cut |
 
 **Additional**
 
@@ -411,12 +412,67 @@ Query the device for its status, what is its state.
 ```
 
 - **You should see:** a reply on `evt/status` (section 6) with the current
-  firmware version, the LED pattern, the image on the e-paper, how much room is
+  firmware version, the LED pattern, the image on the e-paper, the current time
+  and where it came from, how much room is
   left on the SD card and a few
   supporting details.
 
 The command takes no fields — it is a bare query, so an empty message is fine.
 Nothing is changed by sending it, and the reply is **not** retained.
+
+---
+
+### 5.8 Set the timezone — `cmd/timezone`
+
+Tell the device where it is, so it can report local time and not just UTC. It
+does not look this up from the IP address: you declare it.
+
+- **Topic:** `thelink/0A1B2C3D4E5F/cmd/timezone`
+
+**For India (IST, UTC+05:30):**
+
+```json
+{
+  "tz": "IST-5:30"
+}
+```
+
+**For Germany in summer (CEST, UTC+02:00):**
+
+```json
+{
+  "tz": "CEST-2"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tz` | string | Yes | The timezone as a POSIX string (see below) |
+
+**The sign is inverted, and this trips everyone up.** A POSIX offset is the time
+you **add to local time to reach UTC**. India is ahead of UTC by 5½ hours, so it
+is `-5:30`, not `+5:30`. Writing `IST+5:30` would put the device five and a half
+hours *behind* UTC.
+
+**This is not an IANA name.** `"Asia/Kolkata"` will be rejected with a note in
+the log rather than silently doing nothing, because the C library in this firmware
+ships no timezone database to resolve it against. Use the POSIX form — any label
+you like (`IST`, `CET`, whatever) followed by the offset.
+
+The device logs the offset it actually ended up applying, so check the serial log
+or `evt/log` if the local time looks wrong:
+
+```
+I (1234) TIME: timezone "IST-5:30" applied, UTC offset is +05:30
+```
+
+The setting is written to the SD card and survives a reboot. The `THELINK_TZ`
+build option is only a factory default for a card that has never been told
+otherwise.
+
+**Daylight saving is not automatic.** A fixed offset like `IST-5:30` is correct
+year-round for India, but a place that changes its offset will need a new
+`cmd/timezone` when it does.
 
 ---
 
@@ -514,6 +570,16 @@ itself. See the troubleshooting table (section 7).
     "humidity_pct": 41.19,
     "age_ms": 12430
   },
+  "time": {
+    "utc": "2026-09-26T06:12:33Z",
+    "epoch_s": 1788297153,
+    "local": "2026-09-26T11:42:33+05:30",
+    "tz": "IST-5:30",
+    "source": "sntp",
+    "synced": true,
+    "age_ms": 51230,
+    "rtc": { "present": true, "valid": true }
+  },
   "partition": "ota_0",
   "uptime_ms": 128430,
   "free_heap": 214032,
@@ -530,6 +596,7 @@ itself. See the troubleshooting table (section 7).
 | `image` | string \| null | Full SD path of the image **currently on the e-paper**, or `null` if nothing has been rendered yet |
 | `device_id` | string | Same device ID you used in the topic |
 | `sensor` | object | Cached temperature and humidity — `temperature_c`, `humidity_pct`, and `age_ms`. `null` values until the first sample succeeds. Same contents as `evt/sensor` |
+| `time` | object | The current time, where it came from, and the RTC's state. See the table below |
 | `partition` | string \| null | App partition being executed (`ota_0` in a production build) |
 | `uptime_ms` | number | Milliseconds since boot |
 | `free_heap` | number | Free internal heap, in bytes |
@@ -549,6 +616,38 @@ so it stays fast. Use `age_ms` to tell a fresh reading from one taken at boot.
 is never mistaken for a full one. Its sizes describe the FAT volume, meaning
 filesystem overhead is already excluded — the numbers are what you can actually
 store, not the card's advertised capacity.
+
+#### The `time` object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `utc` | string \| null | The time in UTC, ISO 8601 with a `Z` suffix. `null` if no time has been established yet |
+| `epoch_s` | number \| null | The same instant as a Unix timestamp |
+| `local` | string \| null | Local time with its offset, e.g. `2026-09-26T11:42:33+05:30`. `null` until a timezone is declared |
+| `tz` | string \| null | The timezone string in force, e.g. `IST-5:30`. `null` if none was ever set |
+| `source` | string | `sntp` (corrected against an NTP server), `rtc` (restored from the RTC on boot), or `none` |
+| `synced` | boolean | `true` only when `source` is `sntp` |
+| `age_ms` | number \| null | How long ago the time was last established. `null` when it never has been |
+| `rtc.present` | boolean | Whether a PCF85063 real-time clock answered on the I2C bus |
+| `rtc.valid` | boolean | Whether the RTC is holding a calendar worth reading, either because it survived the last restart or because it was written since. `false` after a power cut, until SNTP writes it |
+
+`source` is the field worth watching. A device showing `sntp` is telling the
+truth. One showing `rtc` has restored its clock from the RTC and is running on that
+until the network catches up — as trustworthy as a drift-free crystal, but not yet
+confirmed. `none` means no time has been established at all, which is the expected
+state straight after a power cut.
+
+`local` and `tz` stay `null` until you send `cmd/timezone` (section 5.8). The
+device does not assume UTC, because a dashboard that silently renders 5:30 as
+"local" is worse than one that says it does not know.
+
+The device syncs to `pool.ntp.org` as soon as it has a network address, and
+re-checks hourly. It also keeps a PCF85063 real-time clock, which it writes on every
+sync and reads at boot, so a unit that reboots without Wi-Fi still reports the right
+time. That is the limit of it: the RTC is powered from the board's 3v3 rail and
+there is no backup cell fitted, so a power cut resets it and the unit has to reach
+SNTP before it knows the time. `source: none` on a freshly plugged-in unit is
+expected, not a fault.
 
 ### `evt/log` — the device's diary
 
@@ -575,7 +674,11 @@ store, not the card's advertised capacity.
 | Nothing happens / no `evt/led` reply | Wrong device ID in the topic, or the broker address doesn't match. Verify the device ID in the boot log |
 | Image doesn't show | Convert it first with `python3 scripts/png_to_epaper.py` — it must be LVGL I8, 200x200, with a 256-colour palette, and hosted on your own HTTP server |
 | Sound doesn't play | File must exist on the SD card (use `"download": ""` for a file already there) |
-| `evt/sensor` never arrives | Start with `ID 0x….  (CRC ok)` and `SHTC3 attached at 0x70`, then the `I2C scan on SDA 47 / SCL 48:` line printed about two seconds after boot. The scan names every device that answered: `0x18` ES8311, `0x51` PCF85063 RTC, `0x70` SHTC3. A missing `0x70`, or an `ID read 0xEFC8 NACKed at 0x70` at attach, is hardware — the sensor never identified itself. If the ID verifies but a read still fails, `measurement command 0x7866 NACKed at 0x70` means it answered the probe and the identity read but not the measurement, and `CRC mismatch` means the bus is noisy. A read is retried three times per cycle, then left to the next 5-minute tick |
+| `evt/sensor` never arrives | Start with `ID 0x….  (CRC ok)` and `SHTC3 attached at 0x70`, then the `I2C scan on SDA 47 / SCL 48:` line printed about two seconds after boot, which lists the addresses that answered. Treat it as a rough indication, not a device list: it shares the bus with the audio codec, and a probe that loses the bus to another task can miss a device that is working. A `swept 0x08..0x77:` line follows it with the totals (answered / did not acknowledge / timed out), and `sweep missed 0x…` warns outright when the scan contradicts a device that just answered — when you see that, the scan is wrong, not the device. The per-device attach lines (`SHTC3 attached at 0x70`, `PCF85063 attached at 0x51`) are the reliable evidence. A failed attach, or an `ID read 0xEFC8 NACKed at 0x70` at attach, is hardware — the sensor never identified itself. If the ID verifies but a read still fails, `measurement command 0x7866 NACKed at 0x70` means it answered the probe and the identity read but not the measurement, and `CRC mismatch` means the bus is noisy. A read is retried three times per cycle, then left to the next 5-minute tick |
+| `time.source` stays `rtc` or `none` | SNTP has not completed. `TIME: SNTP started against pool.ntp.org` means it was started, so look for `synchronized with pool.ntp.org`. The device waits 2 minutes for the first correction and then logs that none arrived, but lwIP keeps retrying in the background and a later correction sets the clock as normal, so that warning alone is not a failure. If it never corrects, the network is blocking UDP 123, or DNS cannot resolve the pool. `none` is the expected state after a power cut until SNTP lands, because the RTC is powered from 3v3 and resets with the board; it is only a fault if it persists after the unit has synced once |
+| `time.local` is `null` | No timezone has been declared. Send `cmd/timezone` (section 5.8) |
+| `time.local` is hours off | The POSIX sign is inverted. `IST+5:30` is *behind* UTC by 5½ hours; India is `IST-5:30`. The device logs the offset it applied — `timezone "…" applied, UTC offset is +05:30` — so check that line against what you expected |
+| `cmd/timezone` is ignored | Look for the reason in the log. A payload with no `tz` string, one that isn't JSON, or an IANA name containing `/` is rejected outright rather than applied |
 
 ---
 
@@ -718,6 +821,23 @@ format.
 ## 9. Version history
 
 ### v0.4.0
+- Time synchronization over SNTP (`pool.ntp.org`), re-checked hourly
+- On-board PCF85063 real-time clock, read at boot to seed the system clock and
+  rewritten from SNTP on every sync, so a unit that reboots without a network
+  still tells the time. It is powered from 3v3, so a power cut resets it and SNTP
+  becomes the only source until it lands
+- New `time` object in the `evt/status` reply: `utc`, `epoch_s`, `local`, `tz`,
+  `source` (`sntp` / `rtc` / `none`), `synced`, `age_ms`, and the RTC's
+  `present` / `valid` state
+- New `cmd/timezone` command (section 5.8), so `local` can be reported as a real
+  local time rather than left unset
+- The device republishes a full status after every successful sync and on every
+  MQTT reconnect, so a dashboard that subscribes late still gets the corrected
+  time
+- New `cmd/timezone` command to declare where the device is, persisted to
+  `config.json` so it survives a reboot
+- `THELINK_TZ` build option as a factory default for a unit never told otherwise;
+  the stored timezone wins over it
 - On-board SHTC3 temperature and humidity sensor
 - New retained `evt/sensor` event, published at boot and then every 5 minutes,
   and re-published on every MQTT reconnect

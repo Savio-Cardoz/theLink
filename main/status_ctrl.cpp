@@ -17,12 +17,13 @@
 #include "led_ctrl.hpp"
 #include "mqtt_io.hpp"
 #include "sensor_ctrl.hpp"
+#include "time_ctrl.hpp"
 
 #include "status_ctrl.hpp"
 
 static const char *TAG = "app";
 
-static void publish_status(void)
+void status_ctrl::publish()
 {
 	const esp_app_desc_t *desc = esp_app_get_description();
 
@@ -53,6 +54,10 @@ static void publish_status(void)
 	// Cached last-good reading, or nulls when the sensor has not produced a
 	// valid sample yet.
 	sensor_ctrl::status_serialize(root);
+
+	// Wall clock, where it came from, and local time if a timezone was declared.
+	// All null until the RTC or SNTP has established something.
+	time_ctrl::status_serialize(root);
 
 	const esp_partition_t *running = esp_ota_get_running_partition();
 	if (running != nullptr)
@@ -122,7 +127,7 @@ void status_ctrl::handle_status_command(const char *payload)
 {
 	(void)payload;
 	ESP_LOGI(TAG, "Status command received");
-	publish_status();
+	status_ctrl::publish();
 }
 
 void status_ctrl::init(void)

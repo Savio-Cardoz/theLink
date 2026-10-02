@@ -62,8 +62,39 @@ namespace
     // first thing to read when a unit does not report a temperature: an address
     // missing from the list is a hardware problem, an address present but a read
     // that still fails is one of ours.
+    // Addresses the sweep is expected to find, because this unit's own devices
+    // occupy them and at least one of them has just been read successfully. Checked
+    // afterwards so a sweep that disagrees with the hardware is reported as a
+    // defective sweep rather than a dead device.
+    struct known_device_t
+    {
+        uint8_t addr;
+        const char *what;
+    };
+    const known_device_t known[] = {
+        {I2C_SHTC3_DEV_Address, "SHTC3, read at every sample"},
+        {I2C_RTC_DEV_Address, "PCF85063, attached at boot"},
+    };
+
+    bool scan_contains(const uint8_t *list, size_t count, uint8_t addr)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            if (list[i] == addr)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Every boot, so a unit that stops reporting can be diagnosed from its log alone.
+    // Deliberately before the first sample: it is the SHTC3's address that tells us
+    // whether a later read failure is the bus or the sensor, and a sweep run after a
+    // successful read could not tell a dead sensor from a broken bus.
     void sensor_scan_bus()
     {
+        const size_t known_count = sizeof(known) / sizeof(known[0]);
         uint8_t found[SENSOR_SCAN_MAX_FOUND] = {0};
         size_t found_count = 0;
 
@@ -90,8 +121,8 @@ namespace
         }
         if (err != ESP_OK)
         {
-            ESP_LOGW(TAG, "I2C scan on SDA %d / SCL %d failed: %s", ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN,
-                     esp_err_to_name(err));
+            ESP_LOGW(TAG, "I2C scan on SDA %d / SCL %d failed: %s (so far: %s)", ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN,
+                     esp_err_to_name(err), list);
             return;
         }
         if (found_count == 0)
@@ -102,6 +133,20 @@ namespace
         }
 
         ESP_LOGI(TAG, "I2C scan on SDA %d / SCL %d: %s", ESP32_I2C_SDA_PIN, ESP32_I2C_SCL_PIN, list);
+
+        // An address this unit has already talked to successfully, and is still
+        // reported as reading fine from, but which the sweep did not find. That is a
+        // sweep defect, not a hardware fault, and it is the difference between
+        // "sensor died" and "the diagnostic is unreliable".
+        for (size_t i = 0; i < known_count; i++)
+        {
+            if (!scan_contains(found, found_count, known[i].addr))
+            {
+                ESP_LOGW(TAG, "sweep missed 0x%02X (%s), which just answered; the sweep is "
+                              "unreliable here, not the device",
+                         known[i].addr, known[i].what);
+            }
+        }
     }
 
     // Reads the sensor and, on success, refreshes the cache. A read that keeps
