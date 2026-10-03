@@ -37,7 +37,13 @@ void user_app_init(void)
     driver_config.scl = EPD_SCK_PIN;
     driver_config.spi_host = EPD_SPI_NUM;
     driver_config.buffer_len = 5000;
-    epd_static_buffer = (uint8_t *)heap_caps_malloc(5000, MALLOC_CAP_SPIRAM);
+    // Must be DMA-capable (internal RAM), not PSRAM. The SPI master DMAs straight
+    // from this buffer; a PSRAM source forces a 5KB internal bounce buffer to be
+    // allocated per transfer, which fails with ESP_ERR_NO_MEM once BLE + Wi-Fi +
+    // I2S have drained the internal heap (largest block drops below 5KB).
+    // Allocating here, while the internal heap is still large, keeps the panel
+    // write allocation-free for the lifetime of the driver.
+    epd_static_buffer = (uint8_t *)heap_caps_malloc(5000, MALLOC_CAP_DMA);
     assert(epd_static_buffer != NULL);
     driver = new epaper_driver_display(EPD_WIDTH, EPD_HEIGHT, driver_config, epd_static_buffer);
 }

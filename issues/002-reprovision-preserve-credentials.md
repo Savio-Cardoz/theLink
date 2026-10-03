@@ -5,7 +5,7 @@
 | Status | **Open** - design discussion only, not implemented |
 | Raised | 2026-10-02 |
 | Branch | `fixstuff` (design captured alongside the 001 fix) |
-| Related | [`001-epd-154-heap-exhaustion.md`](./001-epd-154-heap-exhaustion.md) |
+| Related | [`001-epd-154-heap-exhaustion.md`](./001-epd-154-heap-exhaustion.md), [`003-epd-spi-dma-no-mem.md`](./003-epd-spi-dma-no-mem.md) |
 
 ## Problem
 

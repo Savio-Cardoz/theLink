@@ -152,18 +152,33 @@ void epaper_driver_display::read_busy() {
     }
 }
 
+// Retry a failed SPI transfer once. A failure here means the panel keeps
+// whatever was last latched, so a single transient NO_MEM silently strands the
+// display on a stale frame while LVGL is told the flush succeeded.
+esp_err_t epaper_driver_display::spi_transmit_with_retry(spi_transaction_t *t, const char *what) {
+    esp_err_t ret = spi_device_polling_transmit(spi, t);
+    if (ret == ESP_OK) {
+        return ret;
+    }
+    ESP_LOGW(TAG, "%s failed: %s - retrying once", what, esp_err_to_name(ret));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ret = spi_device_polling_transmit(spi, t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s failed again after retry: %s - panel will show a stale frame",
+                 what, esp_err_to_name(ret));
+        EPD_LogHeap(what);
+    }
+    return ret;
+}
+
 void epaper_driver_display::SPI_SendByte(uint8_t data) {
-    esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-	t.length = 8;      
-	t.tx_buffer = &data;
-	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-	if (ret != ESP_OK)
-	{
-		ESP_LOGE(TAG, "SPI_SendByte(0x%02x) failed: %s", data, esp_err_to_name(ret));
-		EPD_LogHeap("SPI_SendByte failure");
-	}
+	spi_transaction_t t;
+	memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.tx_buffer = &data;
+    char what[24];
+    snprintf(what, sizeof(what), "SPI_SendByte(0x%02x)", data);
+    spi_transmit_with_retry(&t, what);
 }
 
 void epaper_driver_display::EPD_SendData(uint8_t data) {
@@ -176,44 +191,36 @@ void epaper_driver_display::EPD_SendData(uint8_t data) {
 
 void epaper_driver_display::EPD_SendCommand(uint8_t command) {
     set_dc_0();
-  	set_cs_0();
-  	SPI_SendByte(command);
+   	set_cs_0();
+   	SPI_SendByte(command);
   	set_cs_1();
 }
 
 void epaper_driver_display::writeBytes(uint8_t *buffer,int len) {
     set_dc_1();
   	set_cs_0();
-  	esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-	t.length = 8 * len;      
-	t.tx_buffer = buffer;
-	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-	if (ret != ESP_OK)
-	{
-		ESP_LOGE(TAG, "writeBytes(%d bytes) failed: %s", len, esp_err_to_name(ret));
-		EPD_LogHeap("writeBytes failure");
-	}
+   	spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+   	t.tx_buffer = buffer;
+    char what[32];
+    snprintf(what, sizeof(what), "writeBytes(%d bytes)", len);
+    spi_transmit_with_retry(&t, what);
   	set_cs_1();
 }
 
 void epaper_driver_display::writeBytes(const uint8_t *buffer, int len) {
     set_dc_1();
   	set_cs_0();
-  	esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-	t.length = 8 * len;      
-	t.tx_buffer = buffer;
-	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-	if (ret != ESP_OK)
-	{
-		ESP_LOGE(TAG, "writeBytes(%d bytes from %s) failed: %s", len,
-		         esp_ptr_external_ram(buffer) ? "PSRAM" : "internal", esp_err_to_name(ret));
-		EPD_LogHeap("writeBytes failure");
-	}
-   	set_cs_1();
+   	spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+   	t.tx_buffer = buffer;
+    char what[48];
+    snprintf(what, sizeof(what), "writeBytes(%d bytes from %s)", len,
+             esp_ptr_external_ram(buffer) ? "PSRAM" : "internal");
+    spi_transmit_with_retry(&t, what);
+  	set_cs_1();
 }
 
 void epaper_driver_display::EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend)

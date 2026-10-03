@@ -34,6 +34,8 @@ private:
     void spi_port_init();
     void read_busy();
 
+    esp_err_t spi_transmit_with_retry(spi_transaction_t *t, const char *what);
+
     void set_cs_1(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,1);}
     void set_cs_0(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,0);}
     void set_dc_1(){gpio_set_level((gpio_num_t)lcd_spi_data.dc,1);}

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Resolved** (verified working on device) |
+| Status | **Partially resolved** - see [`003-epd-spi-dma-no-mem.md`](./003-epd-spi-dma-no-mem.md) and [`004-security2-srp-double-free-reboot.md`](./004-security2-srp-double-free-reboot.md) |
 | Reported | 2026-10-02 |
 | Branch | `fixstuff` |
 | Baseline commit | `5e73940` ("untested" - adds heap instrumentation) |
@@ -146,12 +146,17 @@ epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data,
 (`components/user_app/user_app.cpp:40`), instead of the driver allocating
 internally.
 
-> **Correction note.** This is *not* static allocation. The buffer is still
-> `heap_caps_malloc(5000, MALLOC_CAP_SPIRAM)`, and it still lands in PSRAM -
-> which is what the SPI DMA path needs. What actually changed is that the
-> allocation moved from the driver constructor to a single explicit site in
-> `user_app_init()`, so ownership and lifetime are visible. The original
-> 3-argument constructor is retained and still allocates internally.
+> **Correction note.** This is *not* static allocation, and `MALLOC_CAP_SPIRAM`
+> is the wrong capability for this buffer. It is still a `heap_caps_malloc()`,
+> just hoisted to a single explicit site in `user_app_init()` so ownership and
+> lifetime are visible. The original 3-argument constructor is retained and
+> still allocates internally.
+>
+> Keeping it in PSRAM was also the direct cause of a later failure: the SPI
+> master cannot DMA from PSRAM on the S3, so every panel write allocated a
+> 5,000-byte internal bounce buffer, which eventually failed with
+> `ESP_ERR_NO_MEM`. Corrected to `MALLOC_CAP_DMA` in
+> [`003`](./003-epd-spi-dma-no-mem.md).
 
 ### 4. `main/display_ctrl.cpp` - error-path cleanup
 
@@ -183,8 +188,14 @@ unchanged.
 
 - `build-dev/theLink_esp32s3.bin` builds clean, no new warnings introduced by
   these changes.
-- On-device: the device boots and loads the binary images, including the
-  re-provisioned state that previously produced the crash loop.
+- On-device: the device boots and loads the binary images.
+
+> **Superseded in part.** Later hardware evidence (`run_1.log`, 2026-10-03) showed
+> the heap pressure was reduced but not eliminated: the E-Paper SPI write still
+> failed with `ESP_ERR_NO_MEM` during provisioning, leaving the QR code off the
+> panel. Root cause and fix are in
+> [`003-epd-spi-dma-no-mem.md`](./003-epd-spi-dma-no-mem.md). Fix 3 below was
+> insufficient - see its correction note.
 
 ### Rebase onto `master` (`5fdabd4`)
 
