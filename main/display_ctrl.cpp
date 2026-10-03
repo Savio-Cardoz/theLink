@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -47,6 +48,11 @@ static void display_update_task(void *arg)
 	assert(sd_pixel_buffer != NULL);
 	memset(sd_pixel_buffer, 0xFF, RGB565_SIZE); // Default to a pure white canvas
 
+	// The 1,024-byte palette is kept in SPIRAM rather than as a local: this task
+	// runs a tight stack and the local cost is significant. See issues/008.
+	static uint8_t *palette = (uint8_t *)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+	assert(palette != NULL);
+
 	// 2. Set up our static descriptor wrapper pointing to our unpacked canvas area
 	static lv_image_dsc_t sd_dynamic_bmp;
 	sd_dynamic_bmp.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -87,7 +93,6 @@ static void display_update_task(void *arg)
 				fseek(f, 12, SEEK_SET);
 
 				// Step B: Read the 1,024-byte Color Palette Table (256 colors * 4 bytes/color)
-				uint8_t palette[1024];
 				fread(palette, 1, 1024, f);
 
 				// Step C: Allocate temporary scratchpad memory to read the 40,000 pixel indices
@@ -144,10 +149,17 @@ static void display_update_task(void *arg)
 
 						ui_unlock(); // Release the thread mutex lock
 					}
+
+					// Remaining headroom after the deepest call path (LVGL + file I/O).
+					// Reports the *lowest* free level reached, which is the figure
+					// the canary trips against. See issues/008.
+					ESP_LOGI(TAG, "Display push complete: %s. Stack HWM=%" PRIu32,
+							 file_path.c_str(), (uint32_t)uxTaskGetStackHighWaterMark(NULL));
 				}
 				else
 				{
-					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed.");
+					ESP_LOGE(TAG, "Memory Allocation Error: Scratchpad index buffer failed (40KB in SPIRAM).");
+					if (f != NULL) fclose(f);
 				}
 
 				if (f != NULL) fclose(f);
@@ -263,5 +275,9 @@ void display_ctrl::init(void)
 
 void display_ctrl::start(void)
 {
-	xTaskCreate(display_update_task, "display_update", 4096, NULL, 4, &s_display_task_handle);
+	// ESP-IDF measures xTaskCreate stack depth in bytes. The push path combines
+	// FatFS reads with the LVGL invalidate chain, and interrupts run on this
+	// task's stack, so the LVGL/audio task size is the safe floor here.
+	// See issues/008.
+	xTaskCreate(display_update_task, "display_update", 8192, NULL, 4, &s_display_task_handle);
 }

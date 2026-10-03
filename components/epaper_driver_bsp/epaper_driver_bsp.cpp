@@ -6,8 +6,21 @@
 #include "esp_log.h"
 
 #include "esp_heap_caps.h" 
+#include "esp_err.h"
+#include "esp_system.h"
 
 static const char *TAG = "driver";
+
+void epaper_driver_display::EPD_LogHeap(const char *context) {
+    ESP_LOGI(TAG, "[HEAP] %s: total_free=%u, total_min=%u | INTERNAL free=%u, largest_blk=%u | DMA free=%u | SPIRAM free=%u",
+             context,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
 const uint8_t WF_Full_1IN54[159] =
 {											
@@ -55,7 +68,7 @@ unsigned char WF_PARTIAL_1IN54_0[159] =
     0x02,0x17,0x41,0xB0,0x32,0x28,
 };
 
-epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data) : 
+epaper_driver_display::epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data) : 
     lcd_spi_data(_lcd_spi_data),
     Width(width),
     Height(height) {
@@ -66,6 +79,19 @@ epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_sp
 
     buffer = (uint8_t *)heap_caps_malloc(lcd_spi_data.buffer_len, MALLOC_CAP_SPIRAM);
 	assert(buffer);
+}
+
+epaper_driver_display::epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data, uint8_t *external_buffer) : 
+    lcd_spi_data(_lcd_spi_data),
+    Width(width),
+    Height(height) {
+
+    ESP_LOGI(TAG, "Initialize SPI (external buffer)");
+	spi_port_init();
+	spi_gpio_init();
+
+    buffer = external_buffer;
+	assert(buffer != NULL);
 }
 
 epaper_driver_display::~epaper_driver_display() {
@@ -126,18 +152,38 @@ void epaper_driver_display::read_busy() {
     }
 }
 
+// Retry a failed SPI transfer once. A failure here means the panel keeps
+// whatever was last latched, so a single transient NO_MEM silently strands the
+// display on a stale frame while LVGL is told the flush succeeded.
+esp_err_t epaper_driver_display::spi_transmit_with_retry(spi_transaction_t *t, const char *what) {
+    esp_err_t ret = spi_device_polling_transmit(spi, t);
+    if (ret == ESP_OK) {
+        return ret;
+    }
+    ESP_LOGW(TAG, "%s failed: %s - retrying once", what, esp_err_to_name(ret));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ret = spi_device_polling_transmit(spi, t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s failed again after retry: %s - panel will show a stale frame",
+                 what, esp_err_to_name(ret));
+        EPD_LogHeap(what);
+    }
+    return ret;
+}
+
 void epaper_driver_display::SPI_SendByte(uint8_t data) {
-    esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-  	t.length = 8;      
-  	t.tx_buffer = &data;
-  	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-  	assert(ret == ESP_OK);                      //Should have had no issues.
+	spi_transaction_t t;
+	memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.tx_buffer = &data;
+    char what[24];
+    snprintf(what, sizeof(what), "SPI_SendByte(0x%02x)", data);
+    spi_transmit_with_retry(&t, what);
 }
 
 void epaper_driver_display::EPD_SendData(uint8_t data) {
     set_dc_1();
+
   	set_cs_0();
   	SPI_SendByte(data);
   	set_cs_1();
@@ -145,40 +191,42 @@ void epaper_driver_display::EPD_SendData(uint8_t data) {
 
 void epaper_driver_display::EPD_SendCommand(uint8_t command) {
     set_dc_0();
-  	set_cs_0();
-  	SPI_SendByte(command);
+   	set_cs_0();
+   	SPI_SendByte(command);
   	set_cs_1();
 }
 
 void epaper_driver_display::writeBytes(uint8_t *buffer,int len) {
     set_dc_1();
   	set_cs_0();
-  	esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-  	t.length = 8 * len;      
-  	t.tx_buffer = buffer;
-  	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-  	assert(ret == ESP_OK);
+   	spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+   	t.tx_buffer = buffer;
+    char what[32];
+    snprintf(what, sizeof(what), "writeBytes(%d bytes)", len);
+    spi_transmit_with_retry(&t, what);
   	set_cs_1();
 }
 
 void epaper_driver_display::writeBytes(const uint8_t *buffer, int len) {
     set_dc_1();
   	set_cs_0();
-  	esp_err_t ret;
-  	spi_transaction_t t; 
-  	memset(&t, 0, sizeof(t));
-  	t.length = 8 * len;      
-  	t.tx_buffer = buffer;
-  	ret = spi_device_polling_transmit(spi, &t); //Transmit!
-  	assert(ret == ESP_OK);
+   	spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+   	t.tx_buffer = buffer;
+    char what[48];
+    snprintf(what, sizeof(what), "writeBytes(%d bytes from %s)", len,
+             esp_ptr_external_ram(buffer) ? "PSRAM" : "internal");
+    spi_transmit_with_retry(&t, what);
   	set_cs_1();
 }
 
 void epaper_driver_display::EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend)
 {
     EPD_SendCommand(0x44);  // SET_RAM_X_ADDRESS_START_END_POSITION
+
     EPD_SendData((Xstart>>3) & 0xFF);
     EPD_SendData((Xend>>3) & 0xFF);
 	

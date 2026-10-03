@@ -126,6 +126,12 @@ static lv_obj_t *qr_image_obj = NULL;
 #define PROV_TRANSPORT_BLE "ble"
 #define QRCODE_BASE_URL "https://espressif.github.io/esp-jumpstart/qrcode.html"
 
+/* How long to keep retrying the MQTT client start. 1 s apart, so this covers
+ * both ways provisioning ends: the client hanging up (a few seconds) and the
+ * network_provisioning auto-stop timer (CONFIG_NETWORK_PROV_AUTOSTOP_TIMEOUT,
+ * 30 s by default). */
+#define MQTT_START_MAX_ATTEMPTS 60
+
 /* Signal Wi-Fi events on this event-group */
 const int WIFI_CONNECTED_EVENT = BIT0;
 static EventGroupHandle_t wifi_event_group;
@@ -177,6 +183,9 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
     int qr_size = esp_qrcode_get_size(qrcode);
     const int display_dim = 200;
 
+    ESP_LOGI("QR_UI", "callback entered: qr_size=%d, SPIRAM free=%u",
+             qr_size, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     int scale = display_dim / qr_size;
     if (scale < 1) scale = 1;
 
@@ -193,6 +202,9 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
         ESP_LOGE("QR_UI", "External frame allocation breakdown for QR matrix layer!");
         return;
     }
+
+    ESP_LOGI("QR_UI", "qr_pixel_buffer=%p, scale=%d, offset=(%d,%d)",
+             (void *)qr_pixel_buffer, scale, offset_x, offset_y);
 
     uint16_t *rgb565_dest = (uint16_t *)qr_pixel_buffer;
     for (int i = 0; i < (display_dim * display_dim); i++) {
@@ -225,7 +237,10 @@ static void qr_code_lvgl_display_cb(esp_qrcode_handle_t qrcode) {
     qr_dynamic_bmp.data_size = RGB565_SIZE;
     qr_dynamic_bmp.data = qr_pixel_buffer;
 
-    if (ui_lock(-1)) {
+    bool locked = ui_lock(-1);
+    ESP_LOGI("QR_UI", "ui_lock returned %d", locked);
+
+    if (locked) {
         if (qr_image_obj == NULL) {
             qr_image_obj = lv_image_create(lv_screen_active());
         }
@@ -698,7 +713,35 @@ static void wifi_prov_task(void *arg)
 
 	/* All subsystems are up: start the download pipeline, then MQTT. */
 	download::start();
-	mqtt_io_start();
+
+	/*
+	 * esp-mqtt needs ~6 KB of contiguous internal RAM for mqtt_task. On a
+	 * first-time provisioning boot the Bluetooth controller (BTDM) still holds
+	 * that memory here, so the first attempt can fail to create the task.
+	 * Provisioning teardown is left to the client / the network_provisioning
+	 * auto-stop timer (CONFIG_NETWORK_PROV_AUTOSTOP_TIMEOUT), which returns
+	 * BTDM shortly afterwards - so just keep trying until there is room.
+	 */
+	bool mqtt_up = false;
+	for (int attempt = 1; attempt <= MQTT_START_MAX_ATTEMPTS; attempt++)
+	{
+		if (mqtt_io_start() == ESP_OK)
+		{
+			download::log_heap_info("mqtt_io_start succeeded");
+			mqtt_up = true;
+			break;
+		}
+
+		ESP_LOGW(TAG, "MQTT start attempt %d/%d failed", attempt, MQTT_START_MAX_ATTEMPTS);
+		download::log_heap_info("mqtt_io_start failed, retrying");
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
+
+	if (!mqtt_up)
+	{
+		ESP_LOGE(TAG, "MQTT client not started after %d attempts; running without cloud connectivity",
+				 MQTT_START_MAX_ATTEMPTS);
+	}
 
 	while (1)
 	{

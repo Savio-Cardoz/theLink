@@ -34,6 +34,8 @@ private:
     void spi_port_init();
     void read_busy();
 
+    esp_err_t spi_transmit_with_retry(spi_transaction_t *t, const char *what);
+
     void set_cs_1(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,1);}
     void set_cs_0(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,0);}
     void set_dc_1(){gpio_set_level((gpio_num_t)lcd_spi_data.dc,1);}
@@ -53,7 +55,8 @@ private:
     void EPD_TurnOnDisplayPart();
 
 public:
-    epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data);
+    epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data);
+    epaper_driver_display(int width, int height, custom_lcd_spi_t _lcd_spi_data, uint8_t *external_buffer);
     ~epaper_driver_display();
 
     void EPD_Init();    /* 墨水屏初始化 */
@@ -65,5 +68,7 @@ public:
     void EPD_Init_Partial();
     void EPD_DisplayPart();
     void EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t color);
+
+    void EPD_LogHeap(const char *context);
 };
 #endif
