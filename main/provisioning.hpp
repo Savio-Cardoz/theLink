@@ -23,6 +23,14 @@ void provisioning_register_core_events(void);
 // widgets are locked in, because the task can push a QR overlay.
 void provisioning_start(void);
 
+// Hook run once the station has an IP, i.e. after the provisioning transport
+// has done its job. Subsystems that are not part of provisioning (audio codec,
+// sensors, RTC) must be started from here rather than at boot: while BTDM is
+// resident the internal pool is down to a few hundred free bytes, and their
+// task stacks plus I2S/I2C buffers do not fit alongside it.
+// Runs on the provisioning task, not app_main.
+void provisioning_set_post_provision_hook(void (*hook)(void));
+
 // Provisioning LED state exposed to the LED task (read) and to mqtt_io on
 // connect (clear via app::register_on_connect).
 void prov_set_led_state(led_prov_state_t state);

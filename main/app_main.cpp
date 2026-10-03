@@ -64,8 +64,47 @@ static bool check_reset_button_at_boot(void)
 	return false;
 }
 
+/**
+ * @brief Starts the subsystems that have nothing to do with provisioning.
+ *
+ * Deliberately NOT called at boot. While the provisioning BLE transport is up
+ * the BT controller has taken ~90 KB of internal RAM out of a pool that
+ * esp_wifi_init() had already cut by ~37 KB, leaving only a few hundred bytes
+ * of contiguous DMA-capable memory. Measured on the ESP32-S3 during a
+ * prov-scan session:
+ *
+ *   after network_prov_mgr_start_provisioning  BTCAP largest_blk = 22528
+ *   BLE connected (pre-keygen)                 BTCAP largest_blk =  544
+ *   session established (pre prov-scan)        BTCAP largest_blk =  336
+ *
+ * At 336 contiguous bytes the station cannot allocate the RX buffers needed to
+ * accept an association response, so Wi-Fi association fails with
+ * "Wi-Fi station authentication failed" even though the credentials are right.
+ * The same exhaustion makes AES-GCM response encryption (esp_aes) and the BT
+ * controller's own allocations fail, which is why the SSID list never arrives.
+ *
+ * These tasks are deferred until the station has an IP, so they never compete
+ * with BTDM. Ordering below is load-bearing:
+ *   - sensor_ctrl claims the shared I2C bus, so it must go first;
+ *   - audio_ctrl and time_ctrl both attach to that same bus.
+ */
+static void start_deferred_subsystems(void)
+{
+	// Must run before audio_ctrl::start(): the codec board support installs the
+	// I2C bus itself when it finds none, so the first caller wins. Claiming it
+	// here, off the app_main boot path, keeps that single-threaded.
+	sensor_ctrl::start();
+	audio_ctrl::start();
+
+	// Must run after config_store_load() and after the event loop exists, so the
+	// timezone it restores is not overwritten by the compiled-in default. The RTC
+	// is on the same bus sensor_ctrl just claimed, so it comes second.
+	time_ctrl::start();
+}
+
 extern "C" void app_main(void)
 {
+
 	// Derive device ID from the factory-programmed base MAC address.
 	// Must run before MQTT or any topic-dependent code.
 	identity_init();
@@ -143,8 +182,21 @@ extern "C" void app_main(void)
 	/* Initialize TCP/IP */
 	ESP_ERROR_CHECK(esp_netif_init());
 
+	/*
+	 * The probes from here to display_ctrl::start() bracket the single largest
+	 * internal-memory drop on boot (~74 KB observed on the ESP32-S3). Without
+	 * them that whole window is unaccounted for and there is no way to tell
+	 * Wi-Fi driver static buffers from LVGL. esp_wifi_init() is the prime
+	 * suspect: the static RX/TX/mgmt buffers it allocates are never freed
+	 * until esp_wifi_deinit(), and BLE provisioning then has to share what
+	 * is left with the AES DMA descriptors and the BT controller.
+	 */
+	download::log_heap_info("after esp_netif_init");
+
 	/* Initialize the event loop */
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+	download::log_heap_info("after esp_event_loop_create_default");
 
 	/* Register our event handler for Wi-Fi, IP and Provisioning related events */
 	provisioning_register_core_events();
@@ -154,8 +206,13 @@ extern "C" void app_main(void)
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
 	esp_netif_create_default_wifi_ap();
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
+
+	download::log_heap_info("after esp_netif_create_default_wifi_sta");
+
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	download::log_heap_info("after esp_wifi_init");
 
 	// 1. Initialize the UI and create widgets FIRST while holding the lock.
 	//    MUST run before the provisioning task spawns: user_ui_init() calls
@@ -170,26 +227,21 @@ extern "C" void app_main(void)
 		ui_unlock();
 	}
 
-	// 2. Start display/UI tasks BEFORE provisioning to reduce heap pressure
+	// 2. Start the display/LED feedback before provisioning: the QR overlay the
+	//    user scans is drawn on this stack, and the LED pulses report provisioning
+	//    progress, so both are provisioning-related and stay up.
 	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 8192, NULL, 4, NULL, 1);
 	led_ctrl::start();
+	download::log_heap_info("after led_ctrl::start");
 	display_ctrl::start();
 	xTaskCreate(ui_overlay_task, "ui_overlay", 4096, NULL, 4, NULL);
 	download::log_heap_info("after display_ctrl::start");
 	display_ctrl::boot_kick_if_active();
 
-	// 3. Now start provisioning (WiFi/BLE) after display is ready
+	// 3. Now start provisioning (WiFi/BLE) after display is ready. Audio,
+	//    sensors and the RTC are started by start_deferred_subsystems() once the
+	//    station has an IP -- see the comment on that function.
+	provisioning_set_post_provision_hook(start_deferred_subsystems);
 	provisioning_start();
 	download::log_heap_info("after provisioning_start");
-
-	// Must run before audio_ctrl::start(): the codec board support installs the
-	// I2C bus itself when it finds none, so the first caller wins. Claiming it
-	// here, on the app_main task, keeps that single-threaded.
-	sensor_ctrl::start();
-	audio_ctrl::start();
-
-	// Must run after config_store_load() and after the event loop exists, so the
-	// timezone it restores is not overwritten by the compiled-in default. The RTC
-	// is on the same bus sensor_ctrl just claimed, so it comes second.
-	time_ctrl::start();
 }

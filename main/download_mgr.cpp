@@ -38,8 +38,35 @@ void download::log_heap_info(const char *context)
 	uint32_t total_min = esp_get_minimum_free_heap_size();
 	uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	uint32_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-	ESP_LOGI(TAG, "[HEAP] %s: total_free=%" PRIu32 ", total_min=%" PRIu32 " | INTERNAL free=%" PRIu32 ", largest_blk=%" PRIu32,
-			 context, total_free, total_min, int_free, int_largest);
+
+	/*
+	 * The INTERNAL figure above is not the pool that actually fails. Both
+	 * provisioning allocation failures are capability-restricted:
+	 *
+	 *   esp_aes_process_dma_gcm()  -> heap_caps_calloc(..., MALLOC_CAP_DMA)
+	 *   malloc_ble_controller_mem() -> heap_caps_malloc(..., BLE_CONTROLLER_MALLOC_CAPS)
+	 *
+	 * BLE_CONTROLLER_MALLOC_CAPS is (MALLOC_CAP_8BIT|MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL)
+	 * per components/bt/controller/esp32/bt.c. Both masks exclude SPIRAM, so
+	 * MALLOC_CAP_EXTERNAL memory cannot satisfy them no matter how much PSRAM
+	 * is free -- which is why CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y does not
+	 * relieve either failure. Log the DMA pool and the exact BLE controller
+	 * mask so "Malloc failed" is predictable from the log instead of opaque.
+	 */
+	uint32_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+	uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+	uint32_t btc_free = heap_caps_get_free_size(download::BLE_CONTROLLER_MALLOC_CAPS);
+	uint32_t btc_largest = heap_caps_get_largest_free_block(download::BLE_CONTROLLER_MALLOC_CAPS);
+	uint32_t btc_min = heap_caps_get_minimum_free_size(download::BLE_CONTROLLER_MALLOC_CAPS);
+	uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+	ESP_LOGI(TAG,
+			 "[HEAP] %s: total_free=%" PRIu32 ", total_min=%" PRIu32 " | INTERNAL free=%" PRIu32 ", largest_blk=%" PRIu32
+			 " | DMA free=%" PRIu32 ", largest_blk=%" PRIu32
+			 " | BTCAP free=%" PRIu32 ", largest_blk=%" PRIu32 ", min_free=%" PRIu32
+			 " | SPIRAM free=%" PRIu32,
+			 context, total_free, total_min, int_free, int_largest,
+			 dma_free, dma_largest, btc_free, btc_largest, btc_min, psram_free);
 }
 
 static void notify_download_handler(DownloadTarget target, bool success, const std::string &filepath)

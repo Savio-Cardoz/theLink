@@ -10,6 +10,7 @@
 #include "esp_err.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_heap_caps.h"
 
 #include <network_provisioning/manager.h>
@@ -28,6 +29,8 @@
 static const char *TAG = "app";
 
 static std::atomic<led_prov_state_t> s_led_prov_state{led_prov_state_t::LED_PROV_STATE_NONE};
+
+static void (*s_post_provision_hook)(void) = nullptr;
 
 uint32_t prov_pulse_period_ms(led_prov_state_t state)
 {
@@ -437,10 +440,23 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 		{
 		case PROTOCOMM_TRANSPORT_BLE_CONNECTED:
 			ESP_LOGI(TAG, "BLE transport: Connected!");
+			/*
+			 * Pre-keygen snapshot. The repeated "BLE_INIT: Malloc failed"
+			 * fires ~330 ms after this, while security2 derives the SRP
+			 * public key, so the BTCAP/DMA figures here are the best
+			 * available predictor of whether that allocation will succeed.
+			 */
+			download::log_heap_info("BLE transport connected (pre-keygen)");
 			prov_set_led_state(led_prov_state_t::LED_PROV_STATE_BLE_CONNECTED);
 			break;
 		case PROTOCOMM_TRANSPORT_BLE_DISCONNECTED:
 			ESP_LOGI(TAG, "BLE transport: Disconnected!");
+			/*
+			 * Post-mortem: if BTCAP free is not back where it was at
+			 * connect time, a failed handshake leaked controller memory and
+			 * the next attempt is guaranteed to fail earlier than this one.
+			 */
+			download::log_heap_info("BLE transport disconnected (post-mortem)");
 			break;
 		default:
 			break;
@@ -453,6 +469,14 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 		{
 		case PROTOCOMM_SECURITY_SESSION_SETUP_OK:
 			ESP_LOGI(TAG, "Secured session established!");
+			/*
+			 * The last point before prov-scan. That endpoint triggers a
+			 * Wi-Fi active scan and then security2 must AES-GCM encrypt the
+			 * resulting SSID list. Both failure modes (esp-aes and
+			 * BLE_INIT) appear immediately after this line, while the scan
+			 * is allocating, so snapshot the pools right here.
+			 */
+			download::log_heap_info("security session established (pre prov-scan)");
 			break;
 		case PROTOCOMM_SECURITY_SESSION_INVALID_SECURITY_PARAMS:
 			ESP_LOGE(TAG, "Received invalid security parameters for establishing secure session!");
@@ -488,6 +512,11 @@ void provisioning_register_core_events(void)
 void provisioning_start(void)
 {
 	xTaskCreate(wifi_prov_task, "wifi_prov", 4096, NULL, 5, NULL);
+}
+
+void provisioning_set_post_provision_hook(void (*hook)(void))
+{
+	s_post_provision_hook = hook;
 }
 
 static void wifi_prov_task(void *arg)
@@ -526,9 +555,22 @@ static void wifi_prov_task(void *arg)
 #endif
 	};
 
+	/*
+	 * Bracket the provisioning manager bring-up. network_prov_mgr_init()
+	 * claims the Wi-Fi netif and configures the BLE scheme, and
+	 * network_prov_mgr_start_provisioning() below is what actually starts
+	 * the BT controller. The latter is where the ~5.8 KB INTERNAL drop on a
+	 * provisioning boot comes from; BTDM itself stays resident until the
+	 * provisioning timer expires, so what is logged here is what the AES DMA
+	 * descriptors and the controller will have to share later.
+	 */
+	download::log_heap_info("before network_prov_mgr_init");
+
 	/* Initialize provisioning manager with the
 	 * configuration parameters set above */
 	ESP_ERROR_CHECK(network_prov_mgr_init(config));
+
+	download::log_heap_info("after network_prov_mgr_init");
 
 	bool provisioned = false;
 #ifdef CONFIG_EXAMPLE_RESET_PROVISIONED
@@ -659,6 +701,10 @@ static void wifi_prov_task(void *arg)
 		/* Start provisioning service */
 		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(security, (const void *)sec_params, service_name, service_key));
 
+		/* BT controller is now resident: this is the baseline that every
+		 * later esp-aes / BLE_INIT allocation must fit into. */
+		download::log_heap_info("after network_prov_mgr_start_provisioning");
+
 		/* The handler for the optional endpoint created above.
 		 * This call must be made after starting the provisioning, and only if the endpoint
 		 * has already been created above.
@@ -692,6 +738,46 @@ static void wifi_prov_task(void *arg)
 
 	/* Wait for Wi-Fi connection */
 	xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+
+	if (!provisioned)
+	{
+		/*
+		 * We have just come through BLE provisioning. The
+		 * NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM handler has released the
+		 * controller, but the internal pool it leaves behind is badly fragmented and
+		 * the app's subsystems no longer fit alongside what is left. Measured on the
+		 * ESP32-S3 (BTCAP free / largest_blk):
+		 *
+		 *   after network_prov_mgr_start_provisioning   44783 / 24576
+		 *   before deferred subsystem start              36007 / 22528
+		 *   after  deferred subsystem start              18007 / 11776
+		 *   mqtt_io_start() then failed at                4027 /  2688
+		 *
+		 * 36 KB cannot hold MQTT's ~32 KB plus the codec's I2S buffers. Starting
+		 * them here took the device down: audio_bsp_init() reached ESP_ERROR_CHECK
+		 * with a failed i2s_new_channel() and aborted the chip on core 1.
+		 *
+		 * So restart deliberately instead. The credentials are already committed to
+		 * NVS by the time WIFI_CONNECTED_EVENT fires, so the next boot takes the
+		 * "Already provisioned" path where no BTDM is ever loaded and there is
+		 * ~120 KB free with a 31 KB largest block -- enough for every subsystem.
+		 */
+		download::log_heap_info("provisioning complete, restarting");
+		fflush(stdout);
+		esp_restart();
+	}
+
+	/*
+	 * Already-provisioned boot: the provisioning transport was never started, so
+	 * there is no BTDM to wait for and the subsystems held back from app_main can
+	 * come up straight away. See provisioning.hpp.
+	 */
+	if (s_post_provision_hook != nullptr)
+	{
+		download::log_heap_info("before deferred subsystem start");
+		s_post_provision_hook();
+		download::log_heap_info("after deferred subsystem start");
+	}
 
 	// Clean up binary image representation asset
 	if (ui_lock(-1))
