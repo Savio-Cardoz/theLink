@@ -113,7 +113,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
 	}
 }
 
-void mqtt_io_start(void)
+esp_err_t mqtt_io_start(void)
 {
 	mqtt_register_cmd(identity_topic_cmd_log(), mqtt_logger_handle_command);
 
@@ -133,8 +133,35 @@ void mqtt_io_start(void)
 	}
 
 	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt5_cfg);
+	if (client == NULL)
+	{
+		ESP_LOGE(TAG, "esp_mqtt_client_init failed");
+		app::set_mqtt(NULL);
+		return ESP_FAIL;
+	}
 	app::set_mqtt(client);
 
-	esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt5_event_handler, NULL);
-	esp_mqtt_client_start(client);
+	esp_err_t err = esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt5_event_handler, NULL);
+	if (err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_mqtt_client_register_event failed: %s", esp_err_to_name(err));
+	}
+
+	// esp-mqtt creates mqtt_task here, which needs ~6 KB of contiguous internal
+	// RAM. During first-time provisioning the Bluetooth controller (BTDM) still
+	// holds that memory and this fails with "Error create mqtt task". Report the
+	// failure instead of swallowing it, and tear the client down so a retry does
+	// not leak the state esp_mqtt_client_init() already allocated.
+	err = esp_mqtt_client_start(client);
+	if (err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_mqtt_client_start failed: %s", esp_err_to_name(err));
+		// Clear the handle first: a client with no task would otherwise accept
+		// publishes and report success while delivering nothing.
+		app::set_mqtt(NULL);
+		esp_mqtt_client_destroy(client);
+		return err;
+	}
+
+	return ESP_OK;
 }

@@ -174,6 +174,9 @@ failure is diagnosable instead of looking like a successful flush.
    `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16` (from 32) in `sdkconfig.defaults`,
    worth roughly 25 KB of internal DMA. Left unchanged here because it trades
    Wi-Fi RX throughput and should be an explicit decision.
+   **Done** in [`005-mqtt-task-start-heap.md`](./005-mqtt-task-start-heap.md),
+   where the thin internal heap turned out to be what stopped `mqtt_task` from
+   being created after provisioning.
 2. **`lv_disp_flush_ready()` is still called unconditionally** at
    `main/ui_port.cpp:156`, regardless of whether the panel write succeeded. The
    retry helper now makes the failure loud, but the flush callback still does

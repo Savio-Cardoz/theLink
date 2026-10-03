@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Partially resolved** - see [`003-epd-spi-dma-no-mem.md`](./003-epd-spi-dma-no-mem.md) and [`004-security2-srp-double-free-reboot.md`](./004-security2-srp-double-free-reboot.md) |
+| Status | **Partially resolved** - see [`003-epd-spi-dma-no-mem.md`](./003-epd-spi-dma-no-mem.md), [`004-security2-srp-double-free-reboot.md`](./004-security2-srp-double-free-reboot.md) and [`005-mqtt-task-start-heap.md`](./005-mqtt-task-start-heap.md) |
 | Reported | 2026-10-02 |
 | Branch | `fixstuff` |
 | Baseline commit | `5e73940` ("untested" - adds heap instrumentation) |
